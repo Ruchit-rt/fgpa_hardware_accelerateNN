@@ -1,2 +1,4 @@
 .ipynb_checkpoints
 a.out
+build
+*.prj
