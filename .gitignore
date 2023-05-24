@@ -3,4 +3,5 @@ a.out
 build
 *.prj
 .editorconfig
-*.a
+.vscode/
+jobs
