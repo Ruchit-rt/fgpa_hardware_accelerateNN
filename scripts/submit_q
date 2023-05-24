@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# Submit job to intel devcloud and print the output once finished
+# Usage: ./submit <job_script.sh>
+
+script=$1
+projectdir=$(dirname "$(dirname "$0")")
+stamp=$(date +"%Y%m%d_%H%M%S")
+
+device="fpga_compile"
+if [ script = "run_hardware.sh" ]
+then
+    device="fpga_runtime"
+    exit 1
+fi
+
+qsub_id=$(qsub -l nodes=1:$device:ppn=2 -d $projectdir -o $projectdir/jobs/$script.o$stamp -e $projectdir/jobs/$script.e$stamp $(dirname "$0")/$script)
+
+# job_id=$(echo "$qsub_id" | cut -d '.' -f 1)
+
+echo "Job submitted"
+echo ""
+qstat 
+
+echo -ne "\nWaiting for output file "
+until [ -f $projectdir/jobs/$script.o$stamp ]; do
+    sleep 1
+    echo -n "."
+done
+
+cat $projectdir/jobs/$script.o$stamp
+cat $projectdir/jobs/$script.e$stamp
