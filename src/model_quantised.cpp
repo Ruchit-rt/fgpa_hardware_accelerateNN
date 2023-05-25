@@ -16816,7 +16816,7 @@ void max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor, int8_t *res
                         f = f > cur ? f : cur;
                     }
                 }
-                r[index] = f;
+                r[index[0]][index[1]][index[2]] = f;
             }
         });
     });
@@ -16845,7 +16845,7 @@ void dequant(queue &q, int size, float scale, int8_t *tensor, float *result)
 {
     buffer t_buf(tensor, range(size));
     buffer r_buf(result, range(size));
-    q.submit([&](auto &h) {
+    q.submit([&](handler &h) {
         accessor t(t_buf, h, read_only);
         accessor r(r_buf, h, write_only);
 
@@ -17012,7 +17012,7 @@ void conv_pad_q(queue &q, int chn, int size, int8_t *tensor, int8_t *filter, int
       h.single_task<class ConvIntrID>([=]() {
         const float scale = tensor_scale * filter_scale / result_scale;
         for (int i = 0; i < (size - 2) * (size - 2); i++){
-            int index[2] = { i / (size - 2), i % (size - 2) }
+            int index[3] = { i / ((size - 2) * (size - 2)), (i / (size -2)) % (size - 2), i % (size - 2) };
             int32_t sum = 0;
             #pragma unroll 2 // Partial unrolling for the outermost loop.
             for (int c = 0; c < chn; c++) {
