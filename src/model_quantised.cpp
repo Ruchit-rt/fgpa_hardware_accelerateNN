@@ -1,4 +1,4 @@
-#include <CL/sycl.hpp>
+#include <sycl/sycl.hpp>
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -16860,158 +16860,171 @@ void conv_pad_q(queue &q, int chn, int size, int8_t *tensor, int8_t *filter, int
         buffer b_buf(biases, range(d));
         buffer r_buf(result, range(d, size, size));
 
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
-      accessor m(m_buf, h, read_only);
-      accessor f(f_buf, h, read_only);
-      accessor b(b_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
+            accessor m(m_buf, h, read_only);
+            accessor f(f_buf, h, read_only);
+            accessor b(b_buf, h, read_only);
+            accessor r(r_buf, h, write_only);
 
       // Task for the corner elements
-      h.parallel_for(range(d), [=](auto index) {
-        int32_t sum = 0;
-        const float scale = tensor_scale * filter_scale / result_scale;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = 0; i <= 1; i++) {
-            for (int j = 0; j <= 1; j++) {
-              sum += f[_fi][i + 1][j + 1] * m[c][i][j];        
-            }
-          }
-        }
+            h.single_task<class ConvCornerID>([=]() {
+                for (int index = 0; index < d; index++){
+                    int32_t sum = 0;
+                    const float scale = tensor_scale * filter_scale / result_scale;
+                    for (int c = 0; c < chn; c++) {
+                        int _fi = index * chn + c;
+                        sum += f[_fi][1][1] * m[c][0][0];
+                        sum += f[_fi][1][2] * m[c][0][1];
+                        sum += f[_fi][2][1] * m[c][1][0];
+                        sum += f[_fi][2][2] * m[c][1][1];
+                    }
 
-        sum += b[index];
-        r[index][0][0] = sum > 0 ? round(sum * scale) : 0;
+                sum += b[index];
+                r[index][0][0] = sum > 0 ? round(sum * scale) : 0;
 
-        sum = 0;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = 0; i <= 1; i++) {
-            for (int j = -2; j <= -1; j++) {
-              sum += f[_fi][i + 1][j + 2] * m[c][i][size + j];        
-            }
-          }
-        }
+                sum = 0;
+                for (int c = 0; c < chn; c++) {
+                int _fi = index * chn + c;
+                sum += f[_fi][1][0] * m[c][0][size - 2];
+                sum += f[_fi][1][1] * m[c][0][size - 1];
+                sum += f[_fi][2][0] * m[c][1][size - 2];
+                sum += f[_fi][2][1] * m[c][1][size - 1];
+                }
 
-        sum += b[index];
-        r[index][0][size - 1] = sum > 0 ? round(sum * scale) : 0;
+                sum += b[index];
+                r[index][0][size - 1] = sum > 0 ? round(sum * scale) : 0;
 
-        sum = 0;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = -2; i <= -1; i++) {
-            for (int j = 0; j <= 1; j++) {
-              sum += f[_fi][i + 2][j + 1] * m[c][size + i][j];        
-            }
-          }
-        }
+                sum = 0;
+                for (int c = 0; c < chn; c++) {
+                int _fi = index * chn + c;
+                sum += f[_fi][0][1] * m[c][size - 2][0];        
+                sum += f[_fi][0][2] * m[c][size - 2][1];        
+                sum += f[_fi][1][1] * m[c][size - 1][0];        
+                sum += f[_fi][1][2] * m[c][size - 1][1];        
+                }
 
-        sum += b[index];
-        r[index][size - 1][0] = sum > 0 ? round(sum * scale) : 0;
+                sum += b[index];
+                r[index][size - 1][0] = sum > 0 ? round(sum * scale) : 0;
+                
+                sum = 0;
+                for (int c = 0; c < chn; c++) {
+                int _fi = index * chn + c;
+                sum += f[_fi][0][0] * m[c][size - 2][size - 2];
+                sum += f[_fi][0][1] * m[c][size - 2][size - 1];
+                sum += f[_fi][1][0] * m[c][size - 1][size - 2];
+                sum += f[_fi][1][1] * m[c][size - 1][size - 1];
+                }
 
-        sum = 0;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = -2; i <= -1; i++) {
-            for (int j = -2; j <= -1; j++) {
-              sum += f[_fi][i + 2][j + 2] * m[c][size + i][size + j];        
-            }
-          }
-        }
-
-        sum += b[index];
-        r[index][size - 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
-      }); });
+                sum += b[index];
+                r[index][size - 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
+            }}); });
 
         // Task for the boundary elements.
-        q.submit([&](auto &h)
-                 {
-      accessor m(m_buf, h, read_only);
-      accessor f(f_buf, h, read_only);
-      accessor b(b_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
+        q.submit([&](handler &h) {
 
-      h.parallel_for(range(d, size - 2), [=](auto index) {
-        int32_t sum = 0;
-        const float scale = tensor_scale * filter_scale / result_scale;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = 0; i <= 1; i++) {
-            for (int j = 0; j <= 2; j++) {
-              sum += f[_fi][i + 1][j] * m[c][i][index[1] + j];        
-            }
-          }
-        }
+            accessor m(m_buf, h, read_only);
+            accessor f(f_buf, h, read_only);
+            accessor b(b_buf, h, read_only);
+            accessor r(r_buf, h, write_only);
 
-        sum += b[index[0]];
-        r[index[0]][0][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+            h.single_task<class ConvBoundID>([=]() {
+                const float scale = tensor_scale * filter_scale / result_scale;
+                for (int i = 0; i < d * (size - 2); i++) {
+                    int index[2] = { i / (size - 2), i % (size - 2) };
+                    int32_t sum = 0;
 
-        sum = 0;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = -2; i <= -1; i++) {
-            for (int j = 0; j <= 2; j++) {
-              sum += f[_fi][i + 2][j] * m[c][size + i][index[1] + j];        
-            }
-          }
-        }
+                        for (int c = 0; c < chn; c++)
+                        {
+                            int _fi = index[0] * chn + c;
+                            sum += f[_fi][1][0] * m[c][0][index[1]];
+                            sum += f[_fi][1][1] * m[c][0][index[1] + 1];
+                            sum += f[_fi][1][2] * m[c][0][index[1] + 2];
+                            sum += f[_fi][2][0] * m[c][1][index[1]];
+                            sum += f[_fi][2][1] * m[c][1][index[1] + 1];
+                            sum += f[_fi][2][2] * m[c][1][index[1] + 2];
+                        }
 
-        sum += b[index[0]];
-        r[index[0]][size - 1][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+                        sum += b[index[0]];
+                        r[index[0]][0][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
 
-        sum = 0;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = 0; i <= 2; i++) {
-            for (int j = 0; j <= 1; j++) {
-              sum += f[_fi][i][j + 1] * m[c][index[1] + i][j];        
-            }
-          }
-        }
+                        sum = 0;
+                        for (int c = 0; c < chn; c++)
+                        {
+                            int _fi = index[0] * chn + c;
+                            sum += f[_fi][0][0] * m[c][size - 2][index[1]];
+                            sum += f[_fi][0][1] * m[c][size - 2][index[1] + 1];
+                            sum += f[_fi][0][2] * m[c][size - 2][index[1] + 2];
+                            sum += f[_fi][1][0] * m[c][size - 1][index[1]];
+                            sum += f[_fi][1][1] * m[c][size - 1][index[1] + 1];
+                            sum += f[_fi][1][2] * m[c][size - 1][index[1] + 2];
+                        }
 
-        sum += b[index[0]];
-        r[index[0]][index[1] + 1][0] = sum > 0 ? round(sum * scale) : 0;
+                        sum += b[index[0]];
+                        r[index[0]][size - 1][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
 
-        sum = 0;
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-          for (int i = 0; i <= 2; i++) {
-            for (int j = -2; j <= -1; j++) {
-              sum += f[_fi][i][j + 2] * m[c][index[1] + i][size + j];        
-            }
-          }
-        }
+                        sum = 0;
+                        for (int c = 0; c < chn; c++)
+                        {
+                            int _fi = index[0] * chn + c;
+                            sum += f[_fi][0][1] * m[c][index[1]][0];
+                            sum += f[_fi][0][2] * m[c][index[1]][1];
+                            sum += f[_fi][1][1] * m[c][index[1] + 1][0];
+                            sum += f[_fi][1][2] * m[c][index[1] + 1][1];
+                            sum += f[_fi][2][1] * m[c][index[1] + 2][0];
+                            sum += f[_fi][2][2] * m[c][index[1] + 2][1];
+                        }
 
-        sum += b[index[0]];
-        r[index[0]][index[1] + 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
-      }); });
+                        sum += b[index[0]];
+                        r[index[0]][index[1] + 1][0] = sum > 0 ? round(sum * scale) : 0;
+
+                        sum = 0;
+                        for (int c = 0; c < chn; c++)
+                        {
+                            int _fi = index[0] * chn + c;
+                            sum += f[_fi][0][0] * m[c][index[1]][size - 2];
+                            sum += f[_fi][0][1] * m[c][index[1]][size - 1];
+                            sum += f[_fi][1][0] * m[c][index[1] + 1][size - 2];
+                            sum += f[_fi][1][1] * m[c][index[1] + 1][size - 1];
+                            sum += f[_fi][2][0] * m[c][index[1] + 2][size - 2];
+                            sum += f[_fi][2][1] * m[c][index[1] + 2][size - 1];
+                        }
+
+                        sum += b[index[0]];
+                        r[index[0]][index[1] + 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
+                    }});
+            });
 
         // Task for interior elements (that uses all 3 * 3 filters).
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor f(f_buf, h, read_only);
       accessor b(b_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.parallel_for(range(d, size - 2, size - 2), [=](auto index) {
-        int32_t sum = 0;
+      h.single_task<class ConvIntrID>([=]() {
         const float scale = tensor_scale * filter_scale / result_scale;
-#pragma unroll 2 // Partial unrolling for the outermost loop.
-        for (int c = 0; c < chn; c++) {
-          int _fi = index[0] * chn + c;
-#pragma unroll
-          for (int i = 0; i <= 2; i++) {
-#pragma unroll
-            for (int j = 0; j <= 2; j++) {
-              sum += f[_fi][i][j] * m[c][index[1] + i][index[2] + j];        
+        for (int i = 0; i < (size - 2) * (size - 2); i++){
+            int index[2] = { i / (size - 2), i % (size - 2) }
+            int32_t sum = 0;
+            #pragma unroll 2 // Partial unrolling for the outermost loop.
+            for (int c = 0; c < chn; c++) {
+                int _fi = index[0] * chn + c;
+                #pragma unroll
+                for (int i = 0; i <= 2; i++) {
+                    #pragma unroll
+                    for (int j = 0; j <= 2; j++) {
+                        sum += f[_fi][i][j] * m[c][index[1] + i][index[2] + j];        
+                    }
+                }
             }
-          }
-        }
 
-        sum += b[index[0]];
-        r[index[0]][index[1] + 1][index[2] + 1] = sum > 0 ? round(sum * scale) : 0;
-      }); });
+            sum += b[index[0]];
+            r[index[0]][index[1] + 1][index[2] + 1] = sum > 0 ? round(sum * scale) : 0;
+        }
+      });
+      });
     }
 }
 
