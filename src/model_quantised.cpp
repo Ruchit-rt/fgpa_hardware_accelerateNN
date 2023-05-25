@@ -16799,23 +16799,27 @@ void max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor, int8_t *res
     {
         buffer m_buf(tensor, range(chn, row, col));
         buffer r_buf(result, range(chn, nr, nc));
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
-
-      h.parallel_for(range(chn, nr, nc), [=](auto index) {
-        int max_r = (index[1] + 1) * stride;
-        int max_c = (index[2] + 1) * stride;
-        int8_t f = numeric_limits<int8_t>::lowest();
-        for (int i = index[1] * stride; i < max_r; i++) {
-          for (int j = index[2] * stride; j < max_c; j++) {
-            int8_t cur = m[index[0]][i][j];
-            f = f > cur ? f : cur;
-          }
-        }
-        r[index] = f;
-      }); });
+    
+        h.single_task<class MaxpoolID>([=]() {
+            for (int i = 0; i < chn * nr * nc; i++){
+                int index[3] = {i / (nr * nc), (i / nc) % nr, i % nc};
+                int max_r = (index[1] + 1) * stride;
+                int max_c = (index[2] + 1) * stride;
+                int8_t f = numeric_limits<int8_t>::lowest();
+                for (int i = index[1] * stride; i < max_r; i++) {
+                    for (int j = index[2] * stride; j < max_c; j++) {
+                        int8_t cur = m[index[0]][i][j];
+                        f = f > cur ? f : cur;
+                    }
+                }
+                r[index] = f;
+            }
+        });
+    });
     }
 }
 
