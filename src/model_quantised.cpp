@@ -16845,14 +16845,16 @@ void dequant(queue &q, int size, float scale, int8_t *tensor, float *result)
 {
     buffer t_buf(tensor, range(size));
     buffer r_buf(result, range(size));
-    q.submit([&](auto &h)
-             {
-    accessor t(t_buf, h, read_only);
-    accessor r(r_buf, h, write_only);
+    q.submit([&](auto &h) {
+        accessor t(t_buf, h, read_only);
+        accessor r(r_buf, h, write_only);
 
-    h.parallel_for(range(size), [=](auto index) {
-      r[index] = t[index] * scale;
-    }); });
+        h.single_task<class DequantID>([=]() {
+            for (int i = 0; i < size; i++){
+                r[i] = t[i] * scale;
+            }
+        });
+    });
 }
 
 /* Carry out quantised convolution (with padding) between the TENSOR (1 * CHN * W * W) and the FILTER (D * CHN * 3 * 3), then ReLU. */
