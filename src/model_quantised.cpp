@@ -16826,18 +16826,24 @@ void max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor, int8_t *res
 // Quantise the input TENSOR with the given SCALE.
 void quant(queue &q, int size, float scale, float *tensor, int8_t *result)
 {
-    buffer t_buf(tensor, range(size));
+
+    float* tensor_ptr = (float*) malloc_device(size * sizeof(float), q);
+    q.memcpy(tensor_ptr, &tensor[0], size * sizeof(float));
+    q.wait();
+
     buffer r_buf(result, range(size));
     q.submit([&](handler &h) {
-        accessor t(t_buf, h, read_only);
         accessor r(r_buf, h, write_only);
 
-        h.single_task<class QuantID>([=]() {
+        h.single_task<class QuantID>([=]() [[intel::kernel_args_restrict]]{
+            device_ptr<float> tensor_d(tensor_ptr);
             for (int i = 0; i < size; i++){
-                r[i] = round(t[i] / scale);
+                r[i] = round(tensor_d[i] / scale);
             }
         });
      });
+     q.wait();
+     free(tensor_ptr, q);
 }
 
 // Dequantise the input TENSOR with the given SCALE.
