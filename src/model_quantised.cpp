@@ -16939,7 +16939,6 @@ void conv_pad_q(queue &q, int chn, int size, int8_t *tensor, int8_t *filter, int
                 for (int i = 0; i < d * (size - 2); i++) {
                     int index[2] = { i / (size - 2), i % (size - 2) };
                     int32_t sum = 0;
-
                         for (int c = 0; c < chn; c++)
                         {
                             int _fi = index[0] * chn + c;
@@ -17099,14 +17098,19 @@ void distance_2_similarity(queue &q, int length, float *vector, float *result)
     {
         buffer v_buf(vector, range(length));
         buffer r_buf(result, range(length));
+        constexpr int D2SLENGTH = 47040;
         q.submit([&](handler &h)
                  {
-      accessor v(v_buf, h, read_only);
+      accessor v(v_buf, h, read_write);
       accessor r(r_buf, h, write_only);
 
       h.single_task<class Dist2Sim>([=] () {
-        for (int index = 0; index < length; index++){
-            r[index] = log((v[index] + 1) / (v[index] + 0.0001f));
+        int v_l[D2SLENGTH];
+        for (int i = 0; i < D2SLENGTH; i++){
+            v_l[i] = v[i];
+        }
+        for (int index = 0; index < D2SLENGTH; index++){
+            r[index] = log((v_l[index] + 1) / (v_l[index] + 0.0001f));
         }
       });
     });
