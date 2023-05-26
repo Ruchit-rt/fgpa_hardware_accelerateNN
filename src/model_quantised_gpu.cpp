@@ -16799,27 +16799,23 @@ void max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor, int8_t *res
     {
         buffer m_buf(tensor, range(chn, row, col));
         buffer r_buf(result, range(chn, nr, nc));
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
-    
-        h.single_task<class MaxpoolID>([=]() {
-            for (int i = 0; i < chn * nr * nc; i++){
-                int index[3] = {i / (nr * nc), (i / nc) % nr, i % nc};
-                int max_r = (index[1] + 1) * stride;
-                int max_c = (index[2] + 1) * stride;
-                int8_t f = numeric_limits<int8_t>::lowest();
-                for (int i = index[1] * stride; i < max_r; i++) {
-                    for (int j = index[2] * stride; j < max_c; j++) {
-                        int8_t cur = m[index[0]][i][j];
-                        f = f > cur ? f : cur;
-                    }
-                }
-                r[index[0]][index[1]][index[2]] = f;
-            }
-        });
-    });
+
+      h.parallel_for(range(chn, nr, nc), [=](auto index) {
+        int max_r = (index[1] + 1) * stride;
+        int max_c = (index[2] + 1) * stride;
+        int8_t f = numeric_limits<int8_t>::lowest();
+        for (int i = index[1] * stride; i < max_r; i++) {
+          for (int j = index[2] * stride; j < max_c; j++) {
+            int8_t cur = m[index[0]][i][j];
+            f = f > cur ? f : cur;
+          }
+        }
+        r[index] = f;
+      }); });
     }
 }
 
@@ -16828,16 +16824,14 @@ void quant(queue &q, int size, float scale, float *tensor, int8_t *result)
 {
     buffer t_buf(tensor, range(size));
     buffer r_buf(result, range(size));
-    q.submit([&](handler &h) {
-        accessor t(t_buf, h, read_only);
-        accessor r(r_buf, h, write_only);
+    q.submit([&](auto &h)
+             {
+    accessor t(t_buf, h, read_only);
+    accessor r(r_buf, h, write_only);
 
-        h.single_task<class QuantID>([=]() {
-            for (int i = 0; i < size; i++){
-                r[i] = round(t[i] / scale);
-            }
-        });
-     });
+    h.parallel_for(range(size), [=](auto index) {
+      r[index] = round(t[index] / scale);
+    }); });
 }
 
 // Dequantise the input TENSOR with the given SCALE.
@@ -16845,16 +16839,14 @@ void dequant(queue &q, int size, float scale, int8_t *tensor, float *result)
 {
     buffer t_buf(tensor, range(size));
     buffer r_buf(result, range(size));
-    q.submit([&](handler &h) {
-        accessor t(t_buf, h, read_only);
-        accessor r(r_buf, h, write_only);
+    q.submit([&](auto &h)
+             {
+    accessor t(t_buf, h, read_only);
+    accessor r(r_buf, h, write_only);
 
-        h.single_task<class DequantID>([=]() {
-            for (int i = 0; i < size; i++){
-                r[i] = t[i] * scale;
-            }
-        });
-    });
+    h.parallel_for(range(size), [=](auto index) {
+      r[index] = t[index] * scale;
+    }); });
 }
 
 /* Carry out quantised convolution (with padding) between the TENSOR (1 * CHN * W * W) and the FILTER (D * CHN * 3 * 3), then ReLU. */
@@ -16866,171 +16858,158 @@ void conv_pad_q(queue &q, int chn, int size, int8_t *tensor, int8_t *filter, int
         buffer b_buf(biases, range(d));
         buffer r_buf(result, range(d, size, size));
 
-        q.submit([&](handler &h)
-                 {
-            accessor m(m_buf, h, read_only);
-            accessor f(f_buf, h, read_only);
-            accessor b(b_buf, h, read_only);
-            accessor r(r_buf, h, write_only);
-
-      // Task for the corner elements
-            h.single_task<class ConvCornerID>([=]() {
-                for (int index = 0; index < d; index++){
-                    int32_t sum = 0;
-                    const float scale = tensor_scale * filter_scale / result_scale;
-                    for (int c = 0; c < chn; c++) {
-                        int _fi = index * chn + c;
-                        sum += f[_fi][1][1] * m[c][0][0];
-                        sum += f[_fi][1][2] * m[c][0][1];
-                        sum += f[_fi][2][1] * m[c][1][0];
-                        sum += f[_fi][2][2] * m[c][1][1];
-                    }
-
-                sum += b[index];
-                r[index][0][0] = sum > 0 ? round(sum * scale) : 0;
-
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                int _fi = index * chn + c;
-                sum += f[_fi][1][0] * m[c][0][size - 2];
-                sum += f[_fi][1][1] * m[c][0][size - 1];
-                sum += f[_fi][2][0] * m[c][1][size - 2];
-                sum += f[_fi][2][1] * m[c][1][size - 1];
-                }
-
-                sum += b[index];
-                r[index][0][size - 1] = sum > 0 ? round(sum * scale) : 0;
-
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                int _fi = index * chn + c;
-                sum += f[_fi][0][1] * m[c][size - 2][0];        
-                sum += f[_fi][0][2] * m[c][size - 2][1];        
-                sum += f[_fi][1][1] * m[c][size - 1][0];        
-                sum += f[_fi][1][2] * m[c][size - 1][1];        
-                }
-
-                sum += b[index];
-                r[index][size - 1][0] = sum > 0 ? round(sum * scale) : 0;
-                
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                int _fi = index * chn + c;
-                sum += f[_fi][0][0] * m[c][size - 2][size - 2];
-                sum += f[_fi][0][1] * m[c][size - 2][size - 1];
-                sum += f[_fi][1][0] * m[c][size - 1][size - 2];
-                sum += f[_fi][1][1] * m[c][size - 1][size - 1];
-                }
-
-                sum += b[index];
-                r[index][size - 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
-            }}); });
-
-        // Task for the boundary elements.
-        q.submit([&](handler &h) {
-
-            accessor m(m_buf, h, read_only);
-            accessor f(f_buf, h, read_only);
-            accessor b(b_buf, h, read_only);
-            accessor r(r_buf, h, write_only);
-
-            h.single_task<class ConvBoundID>([=]() {
-                const float scale = tensor_scale * filter_scale / result_scale;
-                for (int i = 0; i < d * (size - 2); i++) {
-                    int index[2] = { i / (size - 2), i % (size - 2) };
-                    int32_t sum = 0;
-
-                        for (int c = 0; c < chn; c++)
-                        {
-                            int _fi = index[0] * chn + c;
-                            sum += f[_fi][1][0] * m[c][0][index[1]];
-                            sum += f[_fi][1][1] * m[c][0][index[1] + 1];
-                            sum += f[_fi][1][2] * m[c][0][index[1] + 2];
-                            sum += f[_fi][2][0] * m[c][1][index[1]];
-                            sum += f[_fi][2][1] * m[c][1][index[1] + 1];
-                            sum += f[_fi][2][2] * m[c][1][index[1] + 2];
-                        }
-
-                        sum += b[index[0]];
-                        r[index[0]][0][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
-
-                        sum = 0;
-                        for (int c = 0; c < chn; c++)
-                        {
-                            int _fi = index[0] * chn + c;
-                            sum += f[_fi][0][0] * m[c][size - 2][index[1]];
-                            sum += f[_fi][0][1] * m[c][size - 2][index[1] + 1];
-                            sum += f[_fi][0][2] * m[c][size - 2][index[1] + 2];
-                            sum += f[_fi][1][0] * m[c][size - 1][index[1]];
-                            sum += f[_fi][1][1] * m[c][size - 1][index[1] + 1];
-                            sum += f[_fi][1][2] * m[c][size - 1][index[1] + 2];
-                        }
-
-                        sum += b[index[0]];
-                        r[index[0]][size - 1][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
-
-                        sum = 0;
-                        for (int c = 0; c < chn; c++)
-                        {
-                            int _fi = index[0] * chn + c;
-                            sum += f[_fi][0][1] * m[c][index[1]][0];
-                            sum += f[_fi][0][2] * m[c][index[1]][1];
-                            sum += f[_fi][1][1] * m[c][index[1] + 1][0];
-                            sum += f[_fi][1][2] * m[c][index[1] + 1][1];
-                            sum += f[_fi][2][1] * m[c][index[1] + 2][0];
-                            sum += f[_fi][2][2] * m[c][index[1] + 2][1];
-                        }
-
-                        sum += b[index[0]];
-                        r[index[0]][index[1] + 1][0] = sum > 0 ? round(sum * scale) : 0;
-
-                        sum = 0;
-                        for (int c = 0; c < chn; c++)
-                        {
-                            int _fi = index[0] * chn + c;
-                            sum += f[_fi][0][0] * m[c][index[1]][size - 2];
-                            sum += f[_fi][0][1] * m[c][index[1]][size - 1];
-                            sum += f[_fi][1][0] * m[c][index[1] + 1][size - 2];
-                            sum += f[_fi][1][1] * m[c][index[1] + 1][size - 1];
-                            sum += f[_fi][2][0] * m[c][index[1] + 2][size - 2];
-                            sum += f[_fi][2][1] * m[c][index[1] + 2][size - 1];
-                        }
-
-                        sum += b[index[0]];
-                        r[index[0]][index[1] + 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
-                    }});
-            });
-
-        // Task for interior elements (that uses all 3 * 3 filters).
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor f(f_buf, h, read_only);
       accessor b(b_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class ConvIntrID>([=]() {
+      // Task for the corner elements
+      h.parallel_for(range(d), [=](auto index) {
+        int32_t sum = 0;
         const float scale = tensor_scale * filter_scale / result_scale;
-        for (int i = 0; i < (size - 2) * (size - 2); i++){
-            int index[3] = { i / ((size - 2) * (size - 2)), (i / (size -2)) % (size - 2), i % (size - 2) };
-            int32_t sum = 0;
-            #pragma unroll 2 // Partial unrolling for the outermost loop.
-            for (int c = 0; c < chn; c++) {
-                int _fi = index[0] * chn + c;
-                #pragma unroll
-                for (int i = 0; i <= 2; i++) {
-                    #pragma unroll
-                    for (int j = 0; j <= 2; j++) {
-                        sum += f[_fi][i][j] * m[c][index[1] + i][index[2] + j];        
-                    }
-                }
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = 0; i <= 1; i++) {
+            for (int j = 0; j <= 1; j++) {
+              sum += f[_fi][i + 1][j + 1] * m[c][i][j];        
             }
-
-            sum += b[index[0]];
-            r[index[0]][index[1] + 1][index[2] + 1] = sum > 0 ? round(sum * scale) : 0;
+          }
         }
-      });
-      });
+
+        sum += b[index];
+        r[index][0][0] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = 0; i <= 1; i++) {
+            for (int j = -2; j <= -1; j++) {
+              sum += f[_fi][i + 1][j + 2] * m[c][i][size + j];        
+            }
+          }
+        }
+
+        sum += b[index];
+        r[index][0][size - 1] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = -2; i <= -1; i++) {
+            for (int j = 0; j <= 1; j++) {
+              sum += f[_fi][i + 2][j + 1] * m[c][size + i][j];        
+            }
+          }
+        }
+
+        sum += b[index];
+        r[index][size - 1][0] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = -2; i <= -1; i++) {
+            for (int j = -2; j <= -1; j++) {
+              sum += f[_fi][i + 2][j + 2] * m[c][size + i][size + j];        
+            }
+          }
+        }
+
+        sum += b[index];
+        r[index][size - 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
+      }); });
+
+        // Task for the boundary elements.
+        q.submit([&](auto &h)
+                 {
+      accessor m(m_buf, h, read_only);
+      accessor f(f_buf, h, read_only);
+      accessor b(b_buf, h, read_only);
+      accessor r(r_buf, h, write_only);
+
+      h.parallel_for(range(d, size - 2), [=](auto index) {
+        int32_t sum = 0;
+        const float scale = tensor_scale * filter_scale / result_scale;
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = 0; i <= 1; i++) {
+            for (int j = 0; j <= 2; j++) {
+              sum += f[_fi][i + 1][j] * m[c][i][index[1] + j];        
+            }
+          }
+        }
+
+        sum += b[index[0]];
+        r[index[0]][0][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = -2; i <= -1; i++) {
+            for (int j = 0; j <= 2; j++) {
+              sum += f[_fi][i + 2][j] * m[c][size + i][index[1] + j];        
+            }
+          }
+        }
+
+        sum += b[index[0]];
+        r[index[0]][size - 1][index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = 0; i <= 2; i++) {
+            for (int j = 0; j <= 1; j++) {
+              sum += f[_fi][i][j + 1] * m[c][index[1] + i][j];        
+            }
+          }
+        }
+
+        sum += b[index[0]];
+        r[index[0]][index[1] + 1][0] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+          for (int i = 0; i <= 2; i++) {
+            for (int j = -2; j <= -1; j++) {
+              sum += f[_fi][i][j + 2] * m[c][index[1] + i][size + j];        
+            }
+          }
+        }
+
+        sum += b[index[0]];
+        r[index[0]][index[1] + 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
+      }); });
+
+        // Task for interior elements (that uses all 3 * 3 filters).
+        q.submit([&](auto &h)
+                 {
+      accessor m(m_buf, h, read_only);
+      accessor f(f_buf, h, read_only);
+      accessor b(b_buf, h, read_only);
+      accessor r(r_buf, h, write_only);
+
+      h.parallel_for(range(d, size - 2, size - 2), [=](auto index) {
+        int32_t sum = 0;
+        const float scale = tensor_scale * filter_scale / result_scale;
+#pragma unroll 2 // Partial unrolling for the outermost loop.
+        for (int c = 0; c < chn; c++) {
+          int _fi = index[0] * chn + c;
+#pragma unroll
+          for (int i = 0; i <= 2; i++) {
+#pragma unroll
+            for (int j = 0; j <= 2; j++) {
+              sum += f[_fi][i][j] * m[c][index[1] + i][index[2] + j];        
+            }
+          }
+        }
+
+        sum += b[index[0]];
+        r[index[0]][index[1] + 1][index[2] + 1] = sum > 0 ? round(sum * scale) : 0;
+      }); });
     }
 }
 
@@ -17042,27 +17021,24 @@ void fully_connected(queue &q, int c_in, int c_out, int8_t *vector,
         buffer v_buf(vector, range(c_in));
         buffer w_buf(weights, range(c_out, c_in));
         buffer r_buf(result, range(c_out));
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor v(v_buf, h, read_only);
       accessor w(w_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class FC>([=] () {
-        for (int index = 0; index < c_out; index++){
-            // The scales are hardcoded for the sole fully-connected layer of our model.
-            const float tensor_scale = 0.01979798823595047;
-            const float filter_scale = 0.009601877070963383;
-            const float result_scale = 0.06617073714733123779;
-            const float scale = tensor_scale * filter_scale / result_scale;
-            int32_t sum = 0;
-            for (int i = 0; i < c_in; i++) {
-                sum += v[i] * w[index][i];
-            }
-            r[index] = round(sum * scale);
+      h.parallel_for(range(c_out), [=](auto index) {
+        // The scales are hardcoded for the sole fully-connected layer of our model.
+        const float tensor_scale = 0.01979798823595047;
+        const float filter_scale = 0.009601877070963383;
+        const float result_scale = 0.06617073714733123779;
+        const float scale = tensor_scale * filter_scale / result_scale;
+        int32_t sum = 0;
+        for (int i = 0; i < c_in; i++) {
+          sum += v[i] * w[index][i];
         }
-      });
-    });
+        r[index] = round(sum * scale);
+      }); });
     }
 }
 
@@ -17073,23 +17049,19 @@ void l2_distance(queue &q, int chn, int length, float *tensor, int d, float *pro
         buffer m_buf(tensor, range(chn, length));
         buffer p_buf(prototypes, range(d, chn));
         buffer r_buf(result, range(d, length));
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor p(p_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class L2Dist>([=] () {
-        for (int i = 0; i < d * length; i++){
-            int index[2] = {i / length, i % length};
-            float sum = 0.0f;
-            for (int c = 0; c < chn; c++) {
-                sum += (m[c][index[1]] - p[index[0]][c]) * (m[c][index[1]] - p[index[0]][c]);
-            }
-            r[index[0]][index[1]] = sqrt(sum);
+      h.parallel_for(range(d, length), [=](auto index) {
+        float sum = 0.0f;
+        for (int c = 0; c < chn; c++) {
+          sum += (m[c][index[1]] - p[index[0]][c]) * (m[c][index[1]] - p[index[0]][c]);
         }
-      });
-    });
+        r[index] = sqrt(sum);
+      }); });
     }
 }
 
@@ -17099,17 +17071,14 @@ void distance_2_similarity(queue &q, int length, float *vector, float *result)
     {
         buffer v_buf(vector, range(length));
         buffer r_buf(result, range(length));
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor v(v_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class Dist2Sim>([=] () {
-        for (int index = 0; index < length; index++){
-            r[index] = log((v[index] + 1) / (v[index] + 0.0001f));
-        }
-      });
-    });
+      h.parallel_for(range(length), [=](auto index) {
+        r[index] = log((v[index] + 1) / (v[index] + 0.0001f));
+      }); });
     }
 }
 
@@ -17119,56 +17088,53 @@ void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *r
     {
         buffer m_buf(tensor, range(chn, length));
         buffer r_buf(result, range(chn));
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h);
 
       // The implementation uses a max-heap to keep track of the 9 largest elements.
-      h.single_task<class Top9>([=] () {
-        for (int index = 0; index < chn; index++){
-            float r_[9];
-            for (int i = 0; i < 9; i++) {
-            r_[i] = m[index][i];
-            int k = i;
-            while (true) {
-                if (((r_[k] >= r_[k / 2]) && is_top) || ((r_[k] <= r_[k / 2]) && !is_top)) break;
-                float temp = r_[k];
-                r_[k] = r_[k / 2];
-                r_[k / 2] = temp;
-                k /= 2;
-            }
-            }
-
-            for (int i = 9; i < length; i++) {
-            if ((m[index][i] > r_[0]) == is_top) {
-                r_[0] = m[index][i];
-                int k = 0;
-                while (k < 9) {
-                if (k >= 4) break;
-
-                if ((r_[k] > r_[2 * k + 1]) == is_top || (r_[k] > r_[2 * k + 2]) == is_top) {
-                    float temp = r_[k];
-                    if ((r_[2 * k + 1] < r_[2 * k + 2]) == is_top) {
-                    r_[k] = r_[2 * k + 1];
-                    r_[2 * k + 1] = temp;
-                    k = 2 * k + 1;
-                    } else {
-                    r_[k] = r_[2 * k + 2];
-                    r_[2 * k + 2] = temp;
-                    k = 2 * k + 2;
-                    }
-                } else {
-                    break;
-                }
-                }
-            }
-            }
-
-            r[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+      h.parallel_for(range(chn), [=](auto index) {
+        float r_[9];
+        for (int i = 0; i < 9; i++) {
+          r_[i] = m[index][i];
+          int k = i;
+          while (true) {
+            if (((r_[k] >= r_[k / 2]) && is_top) || ((r_[k] <= r_[k / 2]) && !is_top)) break;
+            float temp = r_[k];
+            r_[k] = r_[k / 2];
+            r_[k / 2] = temp;
+            k /= 2;
+          }
         }
-      });
-    });
+
+        for (int i = 9; i < length; i++) {
+          if ((m[index][i] > r_[0]) == is_top) {
+            r_[0] = m[index][i];
+            int k = 0;
+            while (k < 9) {
+              if (k >= 4) break;
+
+              if ((r_[k] > r_[2 * k + 1]) == is_top || (r_[k] > r_[2 * k + 2]) == is_top) {
+                float temp = r_[k];
+                if ((r_[2 * k + 1] < r_[2 * k + 2]) == is_top) {
+                  r_[k] = r_[2 * k + 1];
+                  r_[2 * k + 1] = temp;
+                  k = 2 * k + 1;
+                } else {
+                  r_[k] = r_[2 * k + 2];
+                  r_[2 * k + 2] = temp;
+                  k = 2 * k + 2;
+                }
+              } else {
+                break;
+              }
+            }
+          }
+        }
+
+        r[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+      }); });
     }
 }
 
@@ -17179,80 +17145,65 @@ void upsample4(queue &q, int chn, int row, int col, float *tensor, float *result
         buffer m_buf(tensor, range(chn, row, col));
         buffer r_buf(result, range(chn, row * 4, col * 4));
 
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class Upsample1>([=] () {
-        for (int index = 0; index < chn; index++){
-            // auto _q = (index[1] + 2) / 4;
-            for (int i = 0; i < 2; i++) {
-                for (int j = 0; j < 2; j++){
-                    r[index][i][j] = m[index][0][0];
-                    r[index][i][4 * col - 1 - j] = m[index][0][col - 1];
-                    r[index][4 * row - 1 - i][j] = m[index][row - 1][0];
-                    r[index][4 * row - 1 - i][4 * col - 1 - j] = m[index][row - 1][col - 1];
-                }
-            }
+      h.parallel_for(range(chn), [=](auto index) {
+        auto _q = (index[1] + 2) / 4;
+        for (int i = 0; i < 2; i++) {
+          for (int j = 0; j < 2; j++){
+            r[index][i][j] = m[index][0][0];
+            r[index][i][4 * col - 1 - j] = m[index][0][col - 1];
+            r[index][4 * row - 1 - i][j] = m[index][row - 1][0];
+            r[index][4 * row - 1 - i][4 * col - 1 - j] = m[index][row - 1][col - 1];
+          }
         }
-      });
-    });
+      }); });
 
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class Upsample2>([=] () {
-        for (int i = 0; i < chn * (col * 4 - 4); i++){
-            int index[2] = {i / (col * 4 -4), i % (col * 4 -4)};
-            auto _r = 2 * (index[1] % 4) + 1;
-            auto _q = index[1] / 4;
-            for (int i = 0; i < 2; i++) {
-            r[index[0]][i][index[1] + 2] = (m[index[0]][0][_q] * (8 - _r) + m[index[0]][0][_q + 1] * _r) / 8;
-            r[index[0]][4 * row - 1 - i][index[1] + 2] = (m[index[0]][row - 1][_q] * (8 - _r) + m[index[0]][row - 1][_q + 1] * _r) / 8;
-            }
-        }
-      });
-    });
+      h.parallel_for(range(chn, col * 4 - 4), [=](auto index) {
+        auto _r = 2 * (index[1] % 4) + 1;
+        auto _q = index[1] / 4;
+        for (int i = 0; i < 2; i++) {
+          r[index[0]][i][index[1] + 2] = (m[index[0]][0][_q] * (8 - _r) + m[index[0]][0][_q + 1] * _r) / 8;
+          r[index[0]][4 * row - 1 - i][index[1] + 2] = (m[index[0]][row - 1][_q] * (8 - _r) + m[index[0]][row - 1][_q + 1] * _r) / 8;
+          }
+      }); });
 
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class Upsample3>([=] () {
-        for (int i = 0; i < chn * (row * 4 - 4); i++){
-            int index[2] = {i / (row * 4 -4), i % (row * 4 -4)};
-            auto _r = 2 * (index[1] % 4) + 1;
-            auto _q = index[1] / 4;
-            for (int i = 0; i < 2; i++) {
-            r[index[0]][index[1] + 2][i] = (m[index[0]][_q][0] * (8 - _r) + m[index[0]][_q + 1][0] * _r) / 8;
-            r[index[0]][index[1] + 2][4 * col - 1 - i] = (m[index[0]][_q][col - 1] * (8 - _r) + m[index[0]][_q + 1][col - 1] * _r) / 8;
-            }
+      h.parallel_for(range(chn, row * 4 - 4), [=](auto index) {
+        auto _r = 2 * (index[1] % 4) + 1;
+        auto _q = index[1] / 4;
+        for (int i = 0; i < 2; i++) {
+          r[index[0]][index[1] + 2][i] = (m[index[0]][_q][0] * (8 - _r) + m[index[0]][_q + 1][0] * _r) / 8;
+          r[index[0]][index[1] + 2][4 * col - 1 - i] = (m[index[0]][_q][col - 1] * (8 - _r) + m[index[0]][_q + 1][col - 1] * _r) / 8;
         }
-      });
-      });
+      }); });
 
-        q.submit([&](handler &h)
+        q.submit([&](auto &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.single_task<class Upsample4>([=] () {
-        for (int i = 0; i < chn * (row * 4 - 4) * (col * 4 - 4); i++){
-            int index[3] = {i / ((row * 4 - 4) * (col * 4 - 4)), (i / (col * 4 - 4)) % (row * 4 - 4), i % (col * 4 - 4)};
-            auto _r1 = 2 * (index[1] % 4) + 1;
-            auto _q1 = index[1] / 4;
-            auto _r2 = 2 * (index[2] % 4) + 1;
-            auto _q2 = index[2] / 4;
-            r[index[0]][index[1] + 2][index[2] + 2]
-                = (m[index[0]][_q1][_q2] * (8 - _r1) + m[index[0]][_q1 + 1][_q2] * _r1) * (8 - _r2) / 64
-                + (m[index[0]][_q1][_q2 + 1] * (8 - _r1) + m[index[0]][_q1 + 1][_q2 + 1] * _r1) * _r2 / 64;
-        }
-      });
-    });
+      h.parallel_for(range(chn, row * 4 - 4, col * 4 - 4), [=](auto index) {
+        auto _r1 = 2 * (index[1] % 4) + 1;
+        auto _q1 = index[1] / 4;
+        auto _r2 = 2 * (index[2] % 4) + 1;
+        auto _q2 = index[2] / 4;
+        r[index[0]][index[1] + 2][index[2] + 2]
+            = (m[index[0]][_q1][_q2] * (8 - _r1) + m[index[0]][_q1 + 1][_q2] * _r1) * (8 - _r2) / 64
+            + (m[index[0]][_q1][_q2 + 1] * (8 - _r1) + m[index[0]][_q1 + 1][_q2 + 1] * _r1) * _r2 / 64;
+      }); });
     }
 }
 
