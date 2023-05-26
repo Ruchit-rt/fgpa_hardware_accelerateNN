@@ -16832,7 +16832,7 @@ void quant(queue &q, int size, float scale, float *tensor, int8_t *result)
         accessor t(t_buf, h, read_only);
         accessor r(r_buf, h, write_only);
 
-        h.single_task<class Test>([=]() {
+        h.single_task<class QuantID>([=]() {
             for (int i = 0; i < size; i++){
                 r[i] = round(t[i] / scale);
             }
@@ -17042,24 +17042,27 @@ void fully_connected(queue &q, int c_in, int c_out, int8_t *vector,
         buffer v_buf(vector, range(c_in));
         buffer w_buf(weights, range(c_out, c_in));
         buffer r_buf(result, range(c_out));
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor v(v_buf, h, read_only);
       accessor w(w_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.parallel_for(range(c_out), [=](auto index) {
-        // The scales are hardcoded for the sole fully-connected layer of our model.
-        const float tensor_scale = 0.01979798823595047;
-        const float filter_scale = 0.009601877070963383;
-        const float result_scale = 0.06617073714733123779;
-        const float scale = tensor_scale * filter_scale / result_scale;
-        int32_t sum = 0;
-        for (int i = 0; i < c_in; i++) {
-          sum += v[i] * w[index][i];
+      h.single_task<class FC>([=] () {
+        for (int index = 0; index < c_out; index++){
+            // The scales are hardcoded for the sole fully-connected layer of our model.
+            const float tensor_scale = 0.01979798823595047;
+            const float filter_scale = 0.009601877070963383;
+            const float result_scale = 0.06617073714733123779;
+            const float scale = tensor_scale * filter_scale / result_scale;
+            int32_t sum = 0;
+            for (int i = 0; i < c_in; i++) {
+                sum += v[i] * w[index][i];
+            }
+            r[index] = round(sum * scale);
         }
-        r[index] = round(sum * scale);
-      }); });
+      });
+    });
     }
 }
 
@@ -17070,19 +17073,23 @@ void l2_distance(queue &q, int chn, int length, float *tensor, int d, float *pro
         buffer m_buf(tensor, range(chn, length));
         buffer p_buf(prototypes, range(d, chn));
         buffer r_buf(result, range(d, length));
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor p(p_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.parallel_for(range(d, length), [=](auto index) {
-        float sum = 0.0f;
-        for (int c = 0; c < chn; c++) {
-          sum += (m[c][index[1]] - p[index[0]][c]) * (m[c][index[1]] - p[index[0]][c]);
+      h.single_task<class L2Dist>([=] () {
+        for (int i = 0; i < d * length; i++){
+            int index[2] = {i / length, i % length};
+            float sum = 0.0f;
+            for (int c = 0; c < chn; c++) {
+                sum += (m[c][index[1]] - p[index[0]][c]) * (m[c][index[1]] - p[index[0]][c]);
+            }
+            r[index[0]][index[1]] = sqrt(sum);
         }
-        r[index] = sqrt(sum);
-      }); });
+      });
+    });
     }
 }
 
@@ -17092,14 +17099,17 @@ void distance_2_similarity(queue &q, int length, float *vector, float *result)
     {
         buffer v_buf(vector, range(length));
         buffer r_buf(result, range(length));
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor v(v_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.parallel_for(range(length), [=](auto index) {
-        r[index] = log((v[index] + 1) / (v[index] + 0.0001f));
-      }); });
+      h.single_task<class Dist2Sim>([=] () {
+        for (int index = 0; index < length; index++){
+            r[index] = log((v[index] + 1) / (v[index] + 0.0001f));
+        }
+      });
+    });
     }
 }
 
@@ -17109,53 +17119,56 @@ void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *r
     {
         buffer m_buf(tensor, range(chn, length));
         buffer r_buf(result, range(chn));
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h);
 
       // The implementation uses a max-heap to keep track of the 9 largest elements.
-      h.parallel_for(range(chn), [=](auto index) {
-        float r_[9];
-        for (int i = 0; i < 9; i++) {
-          r_[i] = m[index][i];
-          int k = i;
-          while (true) {
-            if (((r_[k] >= r_[k / 2]) && is_top) || ((r_[k] <= r_[k / 2]) && !is_top)) break;
-            float temp = r_[k];
-            r_[k] = r_[k / 2];
-            r_[k / 2] = temp;
-            k /= 2;
-          }
-        }
-
-        for (int i = 9; i < length; i++) {
-          if ((m[index][i] > r_[0]) == is_top) {
-            r_[0] = m[index][i];
-            int k = 0;
-            while (k < 9) {
-              if (k >= 4) break;
-
-              if ((r_[k] > r_[2 * k + 1]) == is_top || (r_[k] > r_[2 * k + 2]) == is_top) {
+      h.single_task<class Top9>([=] () {
+        for (int index = 0; index < chn; index++){
+            float r_[9];
+            for (int i = 0; i < 9; i++) {
+            r_[i] = m[index][i];
+            int k = i;
+            while (true) {
+                if (((r_[k] >= r_[k / 2]) && is_top) || ((r_[k] <= r_[k / 2]) && !is_top)) break;
                 float temp = r_[k];
-                if ((r_[2 * k + 1] < r_[2 * k + 2]) == is_top) {
-                  r_[k] = r_[2 * k + 1];
-                  r_[2 * k + 1] = temp;
-                  k = 2 * k + 1;
-                } else {
-                  r_[k] = r_[2 * k + 2];
-                  r_[2 * k + 2] = temp;
-                  k = 2 * k + 2;
-                }
-              } else {
-                break;
-              }
+                r_[k] = r_[k / 2];
+                r_[k / 2] = temp;
+                k /= 2;
             }
-          }
-        }
+            }
 
-        r[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
-      }); });
+            for (int i = 9; i < length; i++) {
+            if ((m[index][i] > r_[0]) == is_top) {
+                r_[0] = m[index][i];
+                int k = 0;
+                while (k < 9) {
+                if (k >= 4) break;
+
+                if ((r_[k] > r_[2 * k + 1]) == is_top || (r_[k] > r_[2 * k + 2]) == is_top) {
+                    float temp = r_[k];
+                    if ((r_[2 * k + 1] < r_[2 * k + 2]) == is_top) {
+                    r_[k] = r_[2 * k + 1];
+                    r_[2 * k + 1] = temp;
+                    k = 2 * k + 1;
+                    } else {
+                    r_[k] = r_[2 * k + 2];
+                    r_[2 * k + 2] = temp;
+                    k = 2 * k + 2;
+                    }
+                } else {
+                    break;
+                }
+                }
+            }
+            }
+
+            r[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+        }
+      });
+    });
     }
 }
 
@@ -17166,65 +17179,80 @@ void upsample4(queue &q, int chn, int row, int col, float *tensor, float *result
         buffer m_buf(tensor, range(chn, row, col));
         buffer r_buf(result, range(chn, row * 4, col * 4));
 
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.parallel_for(range(chn), [=](auto index) {
-        auto _q = (index[1] + 2) / 4;
-        for (int i = 0; i < 2; i++) {
-          for (int j = 0; j < 2; j++){
-            r[index][i][j] = m[index][0][0];
-            r[index][i][4 * col - 1 - j] = m[index][0][col - 1];
-            r[index][4 * row - 1 - i][j] = m[index][row - 1][0];
-            r[index][4 * row - 1 - i][4 * col - 1 - j] = m[index][row - 1][col - 1];
-          }
+      h.single_task<class Upsample1>([=] () {
+        for (int index = 0; index < chn; index++){
+            // auto _q = (index[1] + 2) / 4;
+            for (int i = 0; i < 2; i++) {
+                for (int j = 0; j < 2; j++){
+                    r[index][i][j] = m[index][0][0];
+                    r[index][i][4 * col - 1 - j] = m[index][0][col - 1];
+                    r[index][4 * row - 1 - i][j] = m[index][row - 1][0];
+                    r[index][4 * row - 1 - i][4 * col - 1 - j] = m[index][row - 1][col - 1];
+                }
+            }
         }
-      }); });
+      });
+    });
 
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.parallel_for(range(chn, col * 4 - 4), [=](auto index) {
-        auto _r = 2 * (index[1] % 4) + 1;
-        auto _q = index[1] / 4;
-        for (int i = 0; i < 2; i++) {
-          r[index[0]][i][index[1] + 2] = (m[index[0]][0][_q] * (8 - _r) + m[index[0]][0][_q + 1] * _r) / 8;
-          r[index[0]][4 * row - 1 - i][index[1] + 2] = (m[index[0]][row - 1][_q] * (8 - _r) + m[index[0]][row - 1][_q + 1] * _r) / 8;
-          }
-      }); });
-
-        q.submit([&](auto &h)
-                 {
-      accessor m(m_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
-
-      h.parallel_for(range(chn, row * 4 - 4), [=](auto index) {
-        auto _r = 2 * (index[1] % 4) + 1;
-        auto _q = index[1] / 4;
-        for (int i = 0; i < 2; i++) {
-          r[index[0]][index[1] + 2][i] = (m[index[0]][_q][0] * (8 - _r) + m[index[0]][_q + 1][0] * _r) / 8;
-          r[index[0]][index[1] + 2][4 * col - 1 - i] = (m[index[0]][_q][col - 1] * (8 - _r) + m[index[0]][_q + 1][col - 1] * _r) / 8;
+      h.single_task<class Upsample2>([=] () {
+        for (int i = 0; i < chn * (col * 4 - 4); i++){
+            int index[2] = {i / (col * 4 -4), i % (col * 4 -4)};
+            auto _r = 2 * (index[1] % 4) + 1;
+            auto _q = index[1] / 4;
+            for (int i = 0; i < 2; i++) {
+            r[index[0]][i][index[1] + 2] = (m[index[0]][0][_q] * (8 - _r) + m[index[0]][0][_q + 1] * _r) / 8;
+            r[index[0]][4 * row - 1 - i][index[1] + 2] = (m[index[0]][row - 1][_q] * (8 - _r) + m[index[0]][row - 1][_q + 1] * _r) / 8;
+            }
         }
-      }); });
+      });
+    });
 
-        q.submit([&](auto &h)
+        q.submit([&](handler &h)
                  {
       accessor m(m_buf, h, read_only);
       accessor r(r_buf, h, write_only);
 
-      h.parallel_for(range(chn, row * 4 - 4, col * 4 - 4), [=](auto index) {
-        auto _r1 = 2 * (index[1] % 4) + 1;
-        auto _q1 = index[1] / 4;
-        auto _r2 = 2 * (index[2] % 4) + 1;
-        auto _q2 = index[2] / 4;
-        r[index[0]][index[1] + 2][index[2] + 2]
-            = (m[index[0]][_q1][_q2] * (8 - _r1) + m[index[0]][_q1 + 1][_q2] * _r1) * (8 - _r2) / 64
-            + (m[index[0]][_q1][_q2 + 1] * (8 - _r1) + m[index[0]][_q1 + 1][_q2 + 1] * _r1) * _r2 / 64;
-      }); });
+      h.single_task<class Upsample3>([=] () {
+        for (int i = 0; i < chn * (row * 4 - 4); i++){
+            int index[2] = {i / (row * 4 -4), i % (row * 4 -4)};
+            auto _r = 2 * (index[1] % 4) + 1;
+            auto _q = index[1] / 4;
+            for (int i = 0; i < 2; i++) {
+            r[index[0]][index[1] + 2][i] = (m[index[0]][_q][0] * (8 - _r) + m[index[0]][_q + 1][0] * _r) / 8;
+            r[index[0]][index[1] + 2][4 * col - 1 - i] = (m[index[0]][_q][col - 1] * (8 - _r) + m[index[0]][_q + 1][col - 1] * _r) / 8;
+            }
+        }
+      });
+      });
+
+        q.submit([&](handler &h)
+                 {
+      accessor m(m_buf, h, read_only);
+      accessor r(r_buf, h, write_only);
+
+      h.single_task<class Upsample4>([=] () {
+        for (int i = 0; i < chn * (row * 4 - 4) * (col * 4 - 4); i++){
+            int index[3] = {i / ((row * 4 - 4) * (col * 4 - 4)), (i / (col * 4 - 4)) % (row * 4 - 4), i % (col * 4 - 4)};
+            auto _r1 = 2 * (index[1] % 4) + 1;
+            auto _q1 = index[1] / 4;
+            auto _r2 = 2 * (index[2] % 4) + 1;
+            auto _q2 = index[2] / 4;
+            r[index[0]][index[1] + 2][index[2] + 2]
+                = (m[index[0]][_q1][_q2] * (8 - _r1) + m[index[0]][_q1 + 1][_q2] * _r1) * (8 - _r2) / 64
+                + (m[index[0]][_q1][_q2 + 1] * (8 - _r1) + m[index[0]][_q1 + 1][_q2 + 1] * _r1) * _r2 / 64;
+        }
+      });
+    });
     }
 }
 
