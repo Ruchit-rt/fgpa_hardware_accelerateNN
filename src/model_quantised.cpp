@@ -16849,18 +16849,25 @@ void quant(queue &q, int size, float scale, float *tensor, int8_t *result)
 // Dequantise the input TENSOR with the given SCALE.
 void dequant(queue &q, int size, float scale, int8_t *tensor, float *result)
 {
-    buffer t_buf(tensor, range(size));
+    int8_t* tensor_ptr = (int8_t*) malloc_device(size * sizeof(int8_t), q);
+    q.memcpy(tensor_ptr, &tensor[0], size * sizeof(int8_t));
+    q.wait();
+
     buffer r_buf(result, range(size));
+
     q.submit([&](handler &h) {
-        accessor t(t_buf, h, read_only);
         accessor r(r_buf, h, write_only);
 
-        h.single_task<class DequantID>([=]() {
+        h.single_task<class DequantID>([=]() [[intel::kernel_args_restrict]]{
+            device_ptr<int8_t> tensor_d(tensor_ptr);
             for (int i = 0; i < size; i++){
-                r[i] = t[i] * scale;
+                r[i] = tensor_d[i] * scale;
             }
         });
     });
+    q.wait();
+
+    free(tensor_ptr, q);
 }
 
 /* Carry out quantised convolution (with padding) between the TENSOR (1 * CHN * W * W) and the FILTER (D * CHN * 3 * 3), then ReLU. */
@@ -17186,83 +17193,95 @@ void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *r
 void upsample4(queue &q, int chn, int row, int col, float *tensor, float *result)
 {
     {
+        float* tensor_ptr = (float*) malloc_device(chn * row * col * sizeof(float), q);
+        float* result_ptr = (float*) malloc_device(chn * row * col * sizeof(float) * 16, q);
+
+        auto host_to_device_event = q.memcpy(tensor_ptr, &tensor[0], chn * row * col * sizeof(float));
+
         buffer m_buf(tensor, range(chn, row, col));
         buffer r_buf(result, range(chn, row * 4, col * 4));
 
-        q.submit([&](handler &h)
-                 {
-      accessor m(m_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
+        auto upsample1_event = q.submit([&](handler &h) {
+            h.depends_on(host_to_device_event);
+            h.single_task<class Upsample1>([=] () [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(tensor_ptr);
+                device_ptr<float> result_d(result_ptr);
+                for (int index = 0; index < chn; index++){
+                    // auto _q = (index[1] + 2) / 4;
+                    for (int i = 0; i < 2; i++) {
+                        for (int j = 0; j < 2; j++){
+                            result_d[(index * row * col) + (i * col) + j] = tensor_d[index * row * col];
+                            result_d[(index * row * col) + (i * col) + 4 * col - 1 - j] = tensor_d[(index * row * col) + col - 1];
+                            result_d[(index * row * col) + (4 * row - 1 - i) * col + j] = tensor_d[(index * row * col) + (row - 1) * col];
+                            result_d[(index * row * col) + (4 * row - 1 - i) * col + 4 * col - 1 - j] = tensor_d[(index * row * col) + ((row - 1) * col) + col - 1];
+                        }
+                    }
+                }
+            });
+        });
 
-      h.single_task<class Upsample1>([=] () {
-        for (int index = 0; index < chn; index++){
-            // auto _q = (index[1] + 2) / 4;
-            for (int i = 0; i < 2; i++) {
-                for (int j = 0; j < 2; j++){
-                    r[index][i][j] = m[index][0][0];
-                    r[index][i][4 * col - 1 - j] = m[index][0][col - 1];
-                    r[index][4 * row - 1 - i][j] = m[index][row - 1][0];
-                    r[index][4 * row - 1 - i][4 * col - 1 - j] = m[index][row - 1][col - 1];
+        auto upsample2_event = q.submit([&](handler &h) {
+            h.depends_on(host_to_device_event);
+            h.single_task<class Upsample2>([=] () [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(tensor_ptr);
+                device_ptr<float> result_d(result_ptr);
+                for (int i = 0; i < chn * (col * 4 - 4); i++){
+                    int index[2] = {i / (col * 4 -4), i % (col * 4 -4)};
+                    auto _r = 2 * (index[1] % 4) + 1;
+                    auto _q = index[1] / 4;
+                    for (int i = 0; i < 2; i++) {
+                    result_d[(index[0] * row * col) + (i * col) + index[1] + 2] = (tensor_d[(index[0] * row * col) + _q] * (8 - _r) + tensor_d[(index[0] * row * col) + _q + 1] * _r) / 8;
+                    result_d[(index[0] * row * col) + (4 * row - 1 - i) * col + index[1] + 2] = (tensor_d[(index[0] * row * col) + (row - 1) * col + _q] * (8 - _r) + tensor_d[(index[0] * row * col) + (row - 1) * col + _q + 1] * _r) / 8;
+                    }
+                }
+            });
+    });
+
+    auto upsample3_event = q.submit([&](handler &h) {
+        h.depends_on(host_to_device_event);
+        h.single_task<class Upsample3>([=] () [[intel::kernel_args_restrict]]{
+            device_ptr<float> tensor_d(tensor_ptr);
+            device_ptr<float> result_d(result_ptr);
+            for (int i = 0; i < chn * (row * 4 - 4); i++){
+                int index[2] = {i / (row * 4 -4), i % (row * 4 -4)};
+                auto _r = 2 * (index[1] % 4) + 1;
+                auto _q = index[1] / 4;
+                for (int i = 0; i < 2; i++) {
+                result_d[(index[0] * row * col) + (index[1] + 2) * col + i] = (tensor_d[(index[0] * row * col) + _q * col] * (8 - _r) + tensor_d[(index[0] * row * col) + (_q + 1) * col] * _r) / 8;
+                result_d[(index[0] * row * col) + (index[1] + 2) * col + 4 * col - 1 - i] = (tensor_d[(index[0] * row * col) + _q * col + col - 1] * (8 - _r) + tensor_d[(index[0] * row * col) + (_q + 1) * col + col - 1] * _r) / 8;
                 }
             }
-        }
+        });
       });
-    });
 
-        q.submit([&](handler &h)
-                 {
-      accessor m(m_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
-
-      h.single_task<class Upsample2>([=] () {
-        for (int i = 0; i < chn * (col * 4 - 4); i++){
-            int index[2] = {i / (col * 4 -4), i % (col * 4 -4)};
-            auto _r = 2 * (index[1] % 4) + 1;
-            auto _q = index[1] / 4;
-            for (int i = 0; i < 2; i++) {
-            r[index[0]][i][index[1] + 2] = (m[index[0]][0][_q] * (8 - _r) + m[index[0]][0][_q + 1] * _r) / 8;
-            r[index[0]][4 * row - 1 - i][index[1] + 2] = (m[index[0]][row - 1][_q] * (8 - _r) + m[index[0]][row - 1][_q + 1] * _r) / 8;
+      auto upsample4_event = q.submit([&](handler &h) {
+        h.depends_on(host_to_device_event);
+        h.single_task<class Upsample4>([=] () [[intel::kernel_args_restrict]]{
+            device_ptr<float> tensor_d(tensor_ptr);
+            device_ptr<float> result_d(result_ptr);
+            for (int i = 0; i < chn * (row * 4 - 4) * (col * 4 - 4); i++){
+                int index[3] = {i / ((row * 4 - 4) * (col * 4 - 4)), (i / (col * 4 - 4)) % (row * 4 - 4), i % (col * 4 - 4)};
+                auto _r1 = 2 * (index[1] % 4) + 1;
+                auto _q1 = index[1] / 4;
+                auto _r2 = 2 * (index[2] % 4) + 1;
+                auto _q2 = index[2] / 4;
+                result_d[(index[0] * row * col) + (index[1] + 2) * col + index[2] + 2]
+                    = (tensor_d[(index[0] * row * col) + _q1 * col +_q2] * (8 - _r1) + tensor_d[(index[0] * row * col) + (_q1 + 1) * col + _q2] * _r1) * (8 - _r2) / 64
+                    + (tensor_d[(index[0] * row * col) + _q1 * col + _q2 + 1] * (8 - _r1) + tensor_d[(index[0] * row * col) + (_q1 + 1) * col + _q2 + 1] * _r1) * _r2 / 64;
             }
-        }
-      });
+        });
     });
 
-        q.submit([&](handler &h)
-                 {
-      accessor m(m_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
-
-      h.single_task<class Upsample3>([=] () {
-        for (int i = 0; i < chn * (row * 4 - 4); i++){
-            int index[2] = {i / (row * 4 -4), i % (row * 4 -4)};
-            auto _r = 2 * (index[1] % 4) + 1;
-            auto _q = index[1] / 4;
-            for (int i = 0; i < 2; i++) {
-            r[index[0]][index[1] + 2][i] = (m[index[0]][_q][0] * (8 - _r) + m[index[0]][_q + 1][0] * _r) / 8;
-            r[index[0]][index[1] + 2][4 * col - 1 - i] = (m[index[0]][_q][col - 1] * (8 - _r) + m[index[0]][_q + 1][col - 1] * _r) / 8;
-            }
-        }
-      });
-      });
-
-        q.submit([&](handler &h)
-                 {
-      accessor m(m_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
-
-      h.single_task<class Upsample4>([=] () {
-        for (int i = 0; i < chn * (row * 4 - 4) * (col * 4 - 4); i++){
-            int index[3] = {i / ((row * 4 - 4) * (col * 4 - 4)), (i / (col * 4 - 4)) % (row * 4 - 4), i % (col * 4 - 4)};
-            auto _r1 = 2 * (index[1] % 4) + 1;
-            auto _q1 = index[1] / 4;
-            auto _r2 = 2 * (index[2] % 4) + 1;
-            auto _q2 = index[2] / 4;
-            r[index[0]][index[1] + 2][index[2] + 2]
-                = (m[index[0]][_q1][_q2] * (8 - _r1) + m[index[0]][_q1 + 1][_q2] * _r1) * (8 - _r2) / 64
-                + (m[index[0]][_q1][_q2 + 1] * (8 - _r1) + m[index[0]][_q1 + 1][_q2 + 1] * _r1) * _r2 / 64;
-        }
-      });
+    // write back after all computation
+    auto device_to_host = q.submit([&] (handler &h) {
+        h.depends_on(upsample1_event);
+        h.depends_on(upsample2_event);
+        h.depends_on(upsample3_event);
+        h.depends_on(upsample4_event);
+        
+        h.memcpy(&result[0], result_ptr, chn * row * col * sizeof(float) * 16);
     });
+    device_to_host.wait();
     }
 }
 
