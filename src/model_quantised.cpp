@@ -17131,7 +17131,7 @@ void distance_2_similarity(queue &q, int length, float *vector, float *result)
 }
 
 /* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
-void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *result, bool is_top)
+void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *result)
 {
     {
         buffer m_buf(tensor, range(chn, length));
@@ -17149,7 +17149,7 @@ void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *r
             r_[i] = m[index][i];
             int k = i;
             while (true) {
-                if (((r_[k] >= r_[k / 2]) && is_top) || ((r_[k] <= r_[k / 2]) && !is_top)) break;
+                if ((r_[k] >= r_[k / 2]) ) break;
                 float temp = r_[k];
                 r_[k] = r_[k / 2];
                 r_[k / 2] = temp;
@@ -17158,15 +17158,74 @@ void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *r
             }
 
             for (int i = 9; i < length; i++) {
-            if ((m[index][i] > r_[0]) == is_top) {
+            if (m[index][i] > r_[0]) {
                 r_[0] = m[index][i];
                 int k = 0;
                 while (k < 9) {
                 if (k >= 4) break;
 
-                if ((r_[k] > r_[2 * k + 1]) == is_top || (r_[k] > r_[2 * k + 2]) == is_top) {
+                if (r_[k] > r_[2 * k + 1] || r_[k] > r_[2 * k + 2]) {
                     float temp = r_[k];
-                    if ((r_[2 * k + 1] < r_[2 * k + 2]) == is_top) {
+                    if (r_[2 * k + 1] < r_[2 * k + 2]) {
+                    r_[k] = r_[2 * k + 1];
+                    r_[2 * k + 1] = temp;
+                    k = 2 * k + 1;
+                    } else {
+                    r_[k] = r_[2 * k + 2];
+                    r_[2 * k + 2] = temp;
+                    k = 2 * k + 2;
+                    }
+                } else {
+                    break;
+                }
+                }
+            }
+            }
+
+            r[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+        }
+      });
+    });
+    }
+}
+
+/* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
+void bottom9_average_pooling(queue &q, int chn, int length, float *tensor, float *result)
+{
+    {
+        buffer m_buf(tensor, range(chn, length));
+        buffer r_buf(result, range(chn));
+        q.submit([&](handler &h)
+                 {
+      accessor m(m_buf, h, read_only);
+      accessor r(r_buf, h);
+
+      // The implementation uses a max-heap to keep track of the 9 largest elements.
+      h.single_task<class Bottom9>([=] () {
+        for (int index = 0; index < chn; index++){
+            float r_[9];
+            for (int i = 0; i < 9; i++) {
+            r_[i] = m[index][i];
+            int k = i;
+            while (true) {
+                if (r_[k] <= r_[k / 2]) break;
+                float temp = r_[k];
+                r_[k] = r_[k / 2];
+                r_[k / 2] = temp;
+                k /= 2;
+            }
+            }
+
+            for (int i = 9; i < length; i++) {
+            if (m[index][i] <= r_[0]) {
+                r_[0] = m[index][i];
+                int k = 0;
+                while (k < 9) {
+                if (k >= 4) break;
+
+                if (r_[k] <= r_[2 * k + 1] || r_[k] <= r_[2 * k + 2]) {
+                    float temp = r_[k];
+                    if (r_[2 * k + 1] >= r_[2 * k + 2]) {
                     r_[k] = r_[2 * k + 1];
                     r_[2 * k + 1] = temp;
                     k = 2 * k + 1;
@@ -17384,7 +17443,7 @@ int main()
         // Prototype layer.
         l2_distance(q, 512, 56 * 56, pooled2_f, 15, prototypes, distances_f);
         distance_2_similarity(q, 15 * 56 * 56, distances_f, similarities_f);
-        top9_average_pooling(q, 15, 56 * 56, similarities_f, avg_f, true);
+        top9_average_pooling(q, 15, 56 * 56, similarities_f, avg_f);
 
         // Fully-connected layer.
         quant(q, 15, 0.01979798823595047, avg_f, avg);
@@ -17392,50 +17451,4 @@ int main()
         dequant(q, 3, 0.06617073714733124, logits, logits_f);
 
         // Compute min_distance (information for interpretation).
-        top9_average_pooling(q, 15, 56 * 56, distances_f, avg_f, false);
-
-        // Compute upsampled activation map (information for interpretation).
-        upsample4(q, 15, 56, 56, similarities_f, upsampled_f);
-
-        auto stop = high_resolution_clock::now();
-        times[i] = duration_cast<microseconds>(stop - start).count();
-    }
-
-    // Print out the output.
-    peek(1, 3, logits_f, true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
-    peek(1, 15, avg_f, false);
-    peek(224, 224, upsampled_f, true);
-    peek(224, 224, upsampled_f + 224 * 224, true);
-    peek(224, 224, upsampled_f + 14 * 224 * 224, true);
-
-    // Output timings.
-    long total = 0;
-    for (int i = 0; i < N; i++)
-    {
-        total += times[i];
-        cout << "Iteration " << (i + 1) << ": " << (float)times[i] / 1e6 << std::endl;
-    }
-
-    cout << "Total: " << (float)total / 1e6 << std::endl;
-
-    delete[] weights1;
-    delete[] biases1;
-    delete[] weights2;
-    delete[] biases2;
-    delete[] prototypes;
-    delete[] fc_weights;
-    delete[] input;
-    delete[] conved1;
-    delete[] pooled1;
-    delete[] conved2;
-    delete[] pooled2;
-    delete[] pooled2_f;
-    delete[] distances_f;
-    delete[] similarities_f;
-    delete[] avg_f;
-    delete[] logits;
-    delete[] logits_f;
-    delete[] upsampled_f;
-
-    return 0;
-}
+        
