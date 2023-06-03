@@ -16745,6 +16745,17 @@ float input_f[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.545
                    0.0588, 0.0667, 0.0863, 0.0980, 0.1137, 0.1294, 0.1451, 0.1608, 0.1451,
                    0.0824, 0.0235, 0.0078};
 
+void exception_handler(sycl::exception_list exceptions) {
+  for (std::exception_ptr const &e : exceptions) {
+    try {
+      std::rethrow_exception(e);
+    } catch (sycl::exception const &e) {
+      std::cout << "Caught asynchronous SYCL exception:\n"
+                << e.what() << std::endl;
+    }
+  }
+}
+
 /* Show the matrix. If snapshot = true, only shwo the first 5 * 5 corner. */
 void peek(int row, int col, float *matrix, bool snapshot)
 {
@@ -17388,18 +17399,30 @@ int main()
 #else // #if FPGA_EMULATOR
     auto selector = sycl::ext::intel::fpga_emulator_selector_v;
 #endif
-    queue q(selector, dpc_common::exception_handler);
+    queue q(selector, exception_handler, sycl::property::queue::enable_profiling{});
+
+    auto device = q.get_device();
+
+    if (!device.has(sycl::aspect::usm_device_allocations)) {
+      std::cerr << "This design must either target a board that supports USM "
+                   "Host/Shared allocations, or IP Component Authoring. "
+                << std::endl;
+      std::terminate();
+    }
+
+    std::cout << "Running on device: "
+              << device.get_info<sycl::info::device::name>().c_str()
+              << std::endl;
 
     // The file that encodes all parameters of the model.
-    ifstream rf_data("data/model_params_quant.mmzk", ios::binary);
-    if (!rf_data)
+    ifstream rf_data("/home/u178815/final-year-project/data/model_params_quant.mmzk", ios::binary);
+    if (!rf_data.is_open())
     {
         cout << "Cannot open file!" << std::endl;
         return 1;
     }
 
-    // Print out hardware name.
-    cout << q.get_device().get_info<info::device::name>() << "\n";
+    cout << "Model parameters file opened successfully" << std::endl;
 
     // Get parameters
     int8_t *weights1 = read_param_int8(rf_data);
