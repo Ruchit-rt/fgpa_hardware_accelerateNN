@@ -15,7 +15,7 @@ using namespace std;
 using namespace sycl;
 
 // Number of iterations.
-#define N 24
+#define N 1
 
 // The test input, a flattened and normalised 3 * 448 * 448 image. It is a picture of a carrot.
 float input_f[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.5451, 0.5569,
@@ -16756,6 +16756,15 @@ void exception_handler(sycl::exception_list exceptions) {
   }
 }
 
+void print_exec_time(event e, string name){
+    auto start_time = e.template
+            get_profiling_info<sycl::info::event_profiling::command_start>();
+    auto end_time = e.template
+            get_profiling_info<sycl::info::event_profiling::command_end>();
+    double dur = (end_time - start_time) / 1.0e9;
+
+    cout <<  name << " event time: " << dur << std::endl;
+}
 /* Show the matrix. If snapshot = true, only shwo the first 5 * 5 corner. */
 void peek(int row, int col, float *matrix, bool snapshot)
 {
@@ -16832,6 +16841,7 @@ int8_t* max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor_ptr)
         });
     });
     pool_event.wait();
+    print_exec_time(pool_event, "Pool");
     free(tensor_ptr, q);
 
     return result_ptr;
@@ -16854,6 +16864,7 @@ int8_t* quant(queue &q, int size, float scale, float *tensor_ptr)
      });
 
      quant_event.wait();
+     print_exec_time(quant_event, "Quant");
      free(tensor_ptr, q);
 
      return result_ptr;
@@ -16875,6 +16886,7 @@ float* dequant(queue &q, int size, float scale, int8_t *tensor_ptr)
         });
     });
     dequant_event.wait();
+    print_exec_time(dequant_event, "Dequant");
     free(tensor_ptr, q);
 
     return result_ptr;
@@ -16971,7 +16983,9 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
                 int32_t sum = 0;
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
+                    #pragma unroll
                     for (int i = 0; i <= 1; i++) {
+                        #pragma unroll
                         for (int j = 0; j <= 2; j++) {
                             sum += filter_d[_fi * 9 + (i+1) * 3 + j] * tensor_d[c * size * size + (i * size) + index[1] + j];
                         }
@@ -16984,7 +16998,9 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
                 sum = 0;
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
+                    #pragma unroll
                     for (int i = -2; i <= -1; i++) {
+                        #pragma unroll
                         for (int j = 0; j <= 2; j++) {
                             sum += filter_d[_fi * 9 + (i + 2) * 3 + j] * tensor_d[c * size * size + (size + i) * size + index[1] + j];      
                         }
@@ -16997,7 +17013,9 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
                 sum = 0;
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
+                    #pragma unroll
                     for (int i = 0; i <= 2; i++) {
+                        #pragma unroll
                         for (int j = 0; j <= 1; j++) {
                             sum += filter_d[_fi * 9 + i * 3 + j + 1] * tensor_d[c * size * size + (index[1] + i) * size + j];        
                         }
@@ -17010,7 +17028,9 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
                 sum = 0;
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
+                    #pragma unroll
                     for (int i = 0; i <= 2; i++) {
+                        #pragma unroll
                         for (int j = -2; j <= -1; j++) {
                         sum += filter_d[_fi * 9 + i * 3 + j + 2] * tensor_d[c * size * size + (index[1] + i) * size + size + j];        
                         }
@@ -17060,6 +17080,10 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
     boundry_event.wait();
     interior_event.wait();
 
+    print_exec_time(corner_event, "Corner conv");
+    print_exec_time(boundry_event, "Boundry conv");
+    print_exec_time(interior_event, "Interior conv");
+
     free(tensor_ptr, q);
     free(filter_ptr, q);
     free(bias_ptr, q);
@@ -17100,6 +17124,7 @@ int8_t* fully_connected(queue &q, int c_in, int c_out, int8_t *tensor_ptr,
     });
 
     fc_event.wait();
+    print_exec_time(fc_event, "FC");
 
     free(weights_ptr, q);
     free(tensor_ptr, q);
@@ -17108,30 +17133,34 @@ int8_t* fully_connected(queue &q, int c_in, int c_out, int8_t *tensor_ptr,
 }
 
 /* The L2-distance computation, used for the prototype layer. */
-float* l2_distance(queue &q, int chn, int length, float *tensor_ptr, int d, float *prototypes)
+float* l2_distance(queue &q, int chn, int length, float *tensor_ptr, int p_len, float *prototypes)
 {
-    float* result_ptr = (float*) malloc_device(d * length * sizeof(float), q);
-    buffer p_buf(prototypes, range(d, chn));
+    float* result_ptr = (float*) malloc_device(p_len * length * sizeof(float), q);
+    float* proto_ptr = (float*) malloc_device(p_len * chn * sizeof(float), q);
 
     auto dist_event = q.submit([&](handler &h) {
-        accessor p(p_buf, h, read_only);
         h.single_task<class L2Dist>([=] () [[intel::kernel_args_restrict]]{
             device_ptr<float> tensor_d(tensor_ptr);
+            device_ptr<float> proto_d(proto_ptr);
             device_ptr<float> result_d(result_ptr);
 
-            for (int i = 0; i < d * length; i++){
-                int index[2] = {i / length, i % length};
-                float sum = 0.0f;
-                for (int c = 0; c < chn; c++) {
-                    sum += (tensor_d[c * length + index[1]] - p[index[0]][c]) * (tensor_d[c * length + index[1]] - p[index[0]][c]);
+            for (int proto_idx = 0; proto_idx < p_len; proto_idx++){
+                for (int feat_idx = 0; feat_idx < length; feat_idx++){
+                    float sum = 0.0f;
+                    for (int c = 0; c < chn; c++) {
+                        float dist = tensor_d[c * length + feat_idx] - proto_d[proto_idx * chn + c];
+                        sum += dist*dist;
+                    }
+                    result_d[proto_idx * length + feat_idx] = sycl::sqrt(sum);
                 }
-                result_d[index[0] * length + index[1]] = sqrt(sum);
             }
         });
     });
 
     dist_event.wait();
+    print_exec_time(dist_event, "Distance");
     free(tensor_ptr, q);
+    free(proto_ptr, q);
 
     return result_ptr;
 }
@@ -17151,6 +17180,7 @@ float* distance_2_similarity(queue &q, int length, float *tensor_ptr)
         });
     });
     sim_event.wait();
+    print_exec_time(sim_event, "Dist 2 Sim");
     free(tensor_ptr, q);
 
     return result_ptr;
@@ -17210,6 +17240,7 @@ float* top9_average_pooling(queue &q, int chn, int length, float *tensor_ptr)
         });
     });
     top9_event.wait();
+    print_exec_time(top9_event, "Top 9");
 
     return result_ptr;
 }
@@ -17355,6 +17386,10 @@ void upsample4(queue &q, int chn, int row, int col, float *tensor_ptr, float* re
         h.memcpy(&result[0], result_ptr, chn * row * col * sizeof(float) * 16);
     });
     device_to_host.wait();
+    print_exec_time(upsample1_event, "Upsample 1");
+    print_exec_time(upsample2_event, "Upsample 2");
+    print_exec_time(upsample3_event, "Upsample 3");
+    print_exec_time(upsample4_event, "Upsample 4");
     free(tensor_ptr, q);
 }
 
@@ -17396,10 +17431,13 @@ int main()
     auto selector = sycl::ext::intel::fpga_simulator_selector_v;
 #elif FPGA_HARDWARE
     auto selector = sycl::ext::intel::fpga_selector_v;
+#elif CPU
+    auto selector = cpu_selector_v;
 #else // #if FPGA_EMULATOR
     auto selector = sycl::ext::intel::fpga_emulator_selector_v;
 #endif
-    queue q(selector, exception_handler, sycl::property::queue::enable_profiling{});
+    property_list queue_properties{sycl::property::queue::enable_profiling()};
+    queue q = sycl::queue(selector, exception_handler, queue_properties);
 
     auto device = q.get_device();
 
