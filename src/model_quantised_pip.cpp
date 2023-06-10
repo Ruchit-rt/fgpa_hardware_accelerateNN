@@ -12,38 +12,54 @@
 
 #include "compute_units.hpp"
 #include "pipe_utils.hpp"
+#include "unrolled_loop.hpp"
 
 using namespace std::chrono;
 using namespace std;
 using namespace sycl;
 
+#ifdef __SYCL_DEVICE_ONLY__
+  #define CL_CONSTANT __attribute__((opencl_constant))
+#else
+  #define CL_CONSTANT
+#endif
 
-constexpr int img_dim = 224;
-constexpr int img_chn = 3;
-constexpr int img_size = img_dim*img_dim;
-
-constexpr double img_scale = 0.01979798823595047;
-constexpr double filter_scale = 0.013484773226082325;
-constexpr double result_scale = 0.04881289601325989;
-
-constexpr int img_burst_size = 2 * img_dim;
-
-
-constexpr int filter_size = 9;
-constexpr int c1_chn = 64;
-constexpr int num_protos = 15;
-constexpr int num_classes = 3;
-
-constexpr float scale = img_scale * filter_scale / result_scale;
+#define PRINTF(format, ...) { \
+            static const CL_CONSTANT char _format[] = format; \
+            sycl::ext::oneapi::experimental::printf(_format, ## __VA_ARGS__); }
 
 template <std::size_t ID> class Quant1ComputeUnits;
+template <std::size_t ID> class DequantComputeUnits;
 template <std::size_t ID> class Conv1FilterComputeNodes;
+template <std::size_t ID> class Conv2FilterComputeNodes;
+template <std::size_t ID> class Conv1AccComputeNodes;
+template <std::size_t ID> class Conv2AccComputeNodes;
+template <std::size_t ID> class MaxPool1ComputeNodes;
+template <std::size_t ID> class MaxPool2ComputeNodes;
 
-using Quant1ToConv1Pipes = fpga_tools::PipeArray<
-                            class Quant1ToConv1PipesID, 
-                            std::array<int8_t, img_burst_size>,
-                            100,
-                            c1_chn>;
+namespace {
+template <typename Func, std::size_t Index>
+    class SubmitOnePipeWrite {
+    public:
+    SubmitOnePipeWrite(Func &&f) {
+        f(std::integral_constant<std::size_t, Index>());
+    }
+};
+
+template <typename Func, std::size_t... Indices>
+inline constexpr void PipeWriteUnroller(Func &&f,
+                                        std::index_sequence<Indices...>) {
+(SubmitOnePipeWrite<Func, Indices>(f), ...); // fold expression
+}
+} //namespace
+
+template <std::size_t N,
+          typename Func>
+
+constexpr void SubmitPipeWrites(Func &&f) {
+  std::make_index_sequence<N> indices;
+  PipeWriteUnroller<>(f, indices);
+}
 // Number of iterations.
 #define N 1
 
@@ -17433,22 +17449,115 @@ float *read_param_float(ifstream &rf)
     return result;
 }
 
+// Quantise the input TENSOR with the given SCALE.
+int8_t* quant(queue &q, int size, float scale, float *tensor_ptr)
+{
+    int8_t* result_ptr = (int8_t*) malloc_shared(size * sizeof(int8_t), q);
 
+    auto quant_event = q.submit([&](handler &h) {
+        h.single_task<class QuantID>([=]() [[intel::kernel_args_restrict]]{
+            device_ptr<float> tensor_d(tensor_ptr);
+            device_ptr<int8_t> result_d(result_ptr);
 
+            for (int i = 0; i < size; i++){
+                result_d[i] = round(tensor_d[i] / scale);
+            }
+        });
+     });
+
+     quant_event.wait();
+     print_exec_time(quant_event, "Quant");
+     free(tensor_ptr, q);
+
+     return result_ptr;
+}
+
+template <int dim, int in_burst_s, int out_burst_s>
+void conv_top_row(std::array<int8_t, in_burst_s> in_burst, int8_t *filter, std::array<int32_t, out_burst_s> out_burst){
+
+    out_burst[0] = in_burst[0]*filter[4] /
+        + in_burst[1]*filter[5] \
+        + in_burst[dim]*filter[7] \
+        + in_burst[dim+1]*filter[8];
+
+    for (int i = 0; i < dim-2; i++){
+
+        out_burst[i] = in_burst[i]*filter[3]/
+            + in_burst[i+1]*filter[4] \
+            + in_burst[i+2]*filter[5] \
+            + in_burst[dim+i]*filter[6] \
+            + in_burst[dim+i+1]*filter[7] \
+            + in_burst[dim+i+2]*filter[8];
+    }
+
+    out_burst[dim-1] = in_burst[dim-2]*filter[3] \
+            + in_burst[dim-1]*filter[4] \
+            + in_burst[2*dim-2]*filter[6] \
+            + in_burst[2*dim-1]*filter[7];
+}
+
+template <int dim, int in_burst_s, int out_burst_s>
+void conv_middle_rows(std::array<int8_t, in_burst_s> in_burst, std::array<int8_t, in_burst_s> last_burst, int8_t *filter, std::array<int32_t, out_burst_s> out_burst){
+    out_burst[0] = in_burst[0]*filter[1] \
+            + last_burst[1]*filter[2]\
+            + last_burst[dim]*filter[4]\
+            + last_burst[dim+1]*filter[5]\
+            + in_burst[0]*filter[7]\
+            + in_burst[1]*filter[8];
+    for (int intr = 0; intr < dim-2; intr++){
+        int32_t sum = 0;
+        #pragma unroll
+        for (int j = 0; j < 3; j++){
+            sum += last_burst[intr+j]*filter[j];
+            sum += last_burst[dim+intr+j]*filter[3+j];
+            sum += in_burst[intr+j]*filter[6+j];
+        }
+        out_burst[intr+1] = sum;
+    }
+    out_burst[dim-1] = last_burst[dim-2]*filter[0] \
+        + last_burst[dim-1]*filter[1] \
+        + last_burst[2*dim-2]*filter[3] \
+        + last_burst[2*dim-1]*filter[4]\
+        + in_burst[dim-2]*filter[6]\
+        + in_burst[dim-1]*filter[7];
+}
+
+template <int dim, int in_burst_s, int out_burst_s>
+void conv_bottom_row(std::array<int8_t, in_burst_s> in_burst, int8_t *filter, std::array<int32_t, out_burst_s> out_burst){
+    out_burst[0] = in_burst[0]*filter[1] /
+                + in_burst[1]*filter[2] \
+                + in_burst[dim]*filter[4] \
+                + in_burst[dim+1]*filter[5];
+
+            for (int i = 0; i < dim-2; i++){
+
+                out_burst[i] = in_burst[i]*filter[0]/
+                    + in_burst[i+1]*filter[1] \
+                    + in_burst[i+2]*filter[2] \
+                    + in_burst[dim+i]*filter[3] \
+                    + in_burst[dim+i+1]*filter[4] \
+                    + in_burst[dim+i+2]*filter[5];
+            }
+
+            out_burst[dim-1] = in_burst[dim-2]*filter[0] \
+                    + in_burst[dim-1]*filter[1] \
+                    + in_burst[2*dim-2]*filter[3] \
+                    + in_burst[2*dim-1]*filter[4];
+}
 int main()
 {
     cout.precision(4);
 
-
-#if FPGA_SIMULATOR
+    // Device Setup ##################################################################
+    #if FPGA_SIMULATOR
     auto selector = sycl::ext::intel::fpga_simulator_selector_v;
-#elif FPGA_HARDWARE
+    #elif FPGA_HARDWARE
     auto selector = sycl::ext::intel::fpga_selector_v;
-#elif CPU
+    #elif CPU
     auto selector = cpu_selector_v;
-#else // #if FPGA_EMULATOR
+    #else // #if FPGA_EMULATOR
     auto selector = sycl::ext::intel::fpga_emulator_selector_v;
-#endif
+    #endif
     property_list queue_properties{sycl::property::queue::enable_profiling()};
     queue q = sycl::queue(selector, exception_handler, queue_properties);
 
@@ -17470,7 +17579,9 @@ int main()
               << device.get_info<sycl::info::device::name>().c_str()
               << std::endl;
 
-    // The file that encodes all parameters of the model.
+    // #####################################################################################
+
+    // Load paramters onto host ############################################################
     ifstream rf_data("/home/u178815/final-year-project/data/model_params_quant.mmzk", ios::binary);
     if (!rf_data.is_open())
     {
@@ -17491,31 +17602,117 @@ int main()
     rf_data.close();
     cout << "Model parameters read" << std::endl;
 
+    // Initialise contant values for the model #############################################
     std::vector<float> logits_f;
     std::vector<float> upsampled_f;
 
+    #if FPGA_EMULATOR
+    constexpr int img_dim = 56;
+    constexpr int c1_chn = 10;
+    constexpr int c2_chn = 20;
+    constexpr int num_protos = 5;
+    #else
+    constexpr int img_dim = 224;
+    constexpr int c1_chn = 64;
+    constexpr int c2_chn = 512;
+    constexpr int num_protos = 15;
+    #endif
+
+    constexpr int img_chn = 3;
+    constexpr int c1_dim = img_dim/2;
+    constexpr int c2_dim = img_dim/4;
+    constexpr int img_size = img_dim*img_dim;
+
+    constexpr double img_scale = 0.01979798823595047;
+    constexpr double filter_scale = 0.013484773226082325;
+    constexpr double result_scale = 0.04881289601325989;
+
+    constexpr int img_bursts = img_dim/2;
+    constexpr int conv1_bursts = img_dim;
+    constexpr int pool1_bursts = c1_dim/2;
+    constexpr int conv2_bursts = c1_dim;
+    constexpr int pool2_bursts = c2_dim;
+    constexpr int dequant_bursts = c2_dim;
+    
+    constexpr int img_burst_size = 2*img_dim;
+    constexpr int conv1_burst_size = img_dim;
+    constexpr int pool1_burst_size = 2*c1_dim;
+    constexpr int conv2_burst_size = c1_dim;
+    constexpr int pool2_burst_size = c2_dim;
+    constexpr int dequant_burst_size = c2_dim;
+
+    constexpr int filter_size = 9;
+    constexpr int num_classes = 3;
+
+    constexpr float scale = img_scale * filter_scale / result_scale;
+
     logits_f.resize(num_classes);
     upsampled_f.resize(num_protos*img_dim*img_dim);
-    cout << "Init outputs" << std::endl;
 
+    // Pipes between the layers of the network ############################################
+    using Quant1Pipes = fpga_tools::PipeArray<
+                            class Quant1ToConv1PipesID,
+                            std::array<int8_t, img_burst_size>,
+                            img_bursts,
+                            img_chn, c1_chn>;
+    using Conv1FilterPipes = fpga_tools::PipeArray<
+                            class Conv1FilterToAccPipesID,
+                            std::array<int32_t, conv1_burst_size>,
+                            conv1_bursts,
+                            img_chn, c1_chn>;
+    using Conv1AccPipes = fpga_tools::PipeArray<
+                            class Conv1AccToPoolPipesID,
+                            std::array<int8_t, conv1_burst_size>,
+                            conv1_bursts,
+                            c1_chn>;
+    using Pool1Pipes = fpga_tools::PipeArray<
+                            class PoolToConv2PipesID,
+                            std::array<int8_t, pool1_burst_size>,
+                            pool1_bursts,
+                            c1_chn, c2_chn>;
+    using Conv2FilterPipes = fpga_tools::PipeArray<
+                            class Conv2FilterToAccPipesID,
+                            std::array<int32_t, conv2_burst_size>,
+                            conv2_bursts,
+                            c1_chn, c2_chn>;
+    using Conv2AccPipes = fpga_tools::PipeArray<
+                            class Conv2AccToPoolPipesID,
+                            std::array<int8_t, conv2_burst_size>,
+                            conv2_bursts,
+                            c2_chn>;
+    using Pool2Pipes = fpga_tools::PipeArray<
+                            class PoolToDequantPipesID,
+                            std::array<int8_t, pool2_burst_size>,
+                            pool2_bursts,
+                            c2_chn>;
+    using DequantPipes = fpga_tools::PipeArray<
+                            class PoolToDequantPipesID,
+                            std::array<float, dequant_burst_size>,
+                            dequant_bursts,
+                            c2_chn, num_protos>;
+
+    // Load image and parameters into device ###############################################
     float *img_f_ptr[img_chn];
-    sycl::event img_to_device_event[img_chn];
     for (int i = 0; i < img_chn; i++){
         if ((img_f_ptr[i] = malloc_device<float>(img_size, q)) == nullptr) {
                     std::cerr << "ERROR: could not allocate space for 'img_f_ptr'\n";
                     std::terminate();
             }
-        img_to_device_event[i] = q.memcpy(img_f_ptr[i], &input_f[i*img_size], img_size * sizeof(float));
+        q.memcpy(img_f_ptr[i], &input_f[i*img_size], img_size * sizeof(float)).wait();
     }
 
-        // int8_t* conv1_f_ptr = (int8_t*) malloc_device(c1_chn * img_chn * filter_size * sizeof(int8_t), q);
-        // int32_t* conv1_b_ptr = (int32_t*) malloc_device(img_chn * sizeof(int32_t), q);
+    int8_t* conv1_f_ptr = (int8_t*) malloc_device(c1_chn * img_chn * filter_size * sizeof(int8_t), q);
+    int32_t* conv1_b_ptr = (int32_t*) malloc_device(img_chn * sizeof(int32_t), q);
+    int8_t* conv2_f_ptr = (int8_t*) malloc_device(c2_chn * c1_chn * filter_size * sizeof(int8_t), q);
+    int32_t* conv2_b_ptr = (int32_t*) malloc_device(c1_chn * sizeof(int32_t), q);
+    
 
-        // auto filter_to_device_event = q.memcpy(conv1_f_ptr, &weights1[0], c1_chn * img_chn * filter_size * sizeof(int8_t));
-        // auto bias_to_device_event = q.memcpy(conv1_b_ptr, &biases1[0], img_chn * sizeof(int32_t));
+    q.memcpy(conv1_f_ptr, &weights1[0], c1_chn * img_chn * filter_size * sizeof(int8_t)).wait();
+    q.memcpy(conv1_b_ptr, &biases1[0], img_chn * sizeof(int32_t)).wait();
+    q.memcpy(conv2_f_ptr, &weights2[0], c2_chn * c1_chn * filter_size * sizeof(int8_t)).wait();
+    q.memcpy(conv2_b_ptr, &biases2[0], c1_chn * sizeof(int32_t)).wait();
+
     cout << "Initialised image" << std::endl;
-
-
 
     // Timings.
     long times[N] = {};
@@ -17524,40 +17721,203 @@ int main()
     {
         auto start = high_resolution_clock::now();
 
-        // Enqueue quantisation kernals for each channel
+        // Enqueue QUANTISATION kernals for each channel ################################################
         SubmitComputeUnits<img_chn, Quant1ComputeUnits>(q, [=](auto ID) [[intel::kernel_args_restrict]]{
             device_ptr<float> img_d(img_f_ptr[ID]);
-            for (int li = 0; li < img_dim / 2; li++ ){
-                    std::array<int8_t, img_burst_size> ddr_read;
-                    #pragma unroll
-                    for (int k = 0; k < img_burst_size; k++){
-                            ddr_read[k] = round(img_d[li * img_burst_size + k] / img_scale);
-                    }
-                    Quant1ToConv1Pipes::write(ddr_read);
+            for (int burst_idx = 0; burst_idx < img_dim / 2; burst_idx++ ){
+                std::array<int8_t, img_burst_size> ddr_read;
+                #pragma unroll
+                for (int k = 0; k < img_burst_size; k++){
+                    ddr_read[k] = round(img_d[burst_idx * img_burst_size + k] / img_scale);
+                }
+                fpga_tools::UnrolledLoop<c1_chn>([&ID, ddr_read](auto PID){
+                    Quant1Pipes::PipeAt<ID,PID>::write(ddr_read);
+                });
             }
         });
         cout << "Pipelined to Conv1" << std::endl;
 
-        SubmitComputeUnits<c1_chn, Conv1FilterComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]){
+        // int8_t *input = (int8_t*) malloc_shared(3 * 448 * 448 * sizeof(int8_t), q);
+        
+        // float* input_f_ptr = (float*) malloc_device(3 * 224 * 224 * sizeof(float), q);
+        // q.memcpy(input_f_ptr, &input_f[0], 3*224*224 * sizeof(float)).wait();
+        // int8_t* input_old = quant(q, 3 * 224 * 224, 0.01979798823595047, input_f_ptr);
+
+        // Enqueue CONVFILTER kernals for each channel ################################################
+        SubmitComputeUnits<c1_chn, Conv1FilterComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+            device_ptr<int8_t> filter_d(conv1_f_ptr);
+            constexpr int in_chn = ID / c1_chn;
+            constexpr int out_chn = ID % c1_chn;
+            int8_t *filter = &filter_d[out_chn*img_chn*filter_size + in_chn*filter_size];
             
-        }
+            std::array<int8_t, img_burst_size> in_burst = Quant1Pipes::PipeAt<in_chn, out_chn>::read();
+            std::array<int32_t, conv1_burst_size> out_burst;
 
+            conv_top_row<img_dim, img_burst_size, conv1_burst_size>(in_burst, filter, out_burst);
+            Conv1FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
 
-        // auto conv1_event = q.submit([&](handler &h) {
-        //         h.depends_on(filter_to_device_event);
-        //         h.depends_on(bias_to_device_event);
+            std::array<int8_t, img_burst_size> last_burst = in_burst;
+            for (int i = 0; i < (img_dim / 2) - 1; i++){
+                in_burst = Quant1Pipes::PipeAt<in_chn, out_chn>::read();
+                std::array<int32_t, conv1_burst_size> out_burst;
 
-        //         h.single_task<class Conv1ID>([=]() [[intel::kernel_args_restrict]]{
-        //                 Convolve<img_chn,img_dim,c1_chn,filter_size,HostToConv1Pipe>(img_ptr, conv1_f_ptr, conv1_b_ptr, scale, conved1_ptr);
-        //         });
+                conv_middle_rows<img_dim, img_burst_size, conv1_burst_size>(in_burst, last_burst, filter, out_burst);
 
-        // });
+                Conv1FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+                last_burst = in_burst;
+                
+            }
+            conv_bottom_row<img_dim, img_burst_size, conv1_burst_size>(in_burst, filter, out_burst);
 
-        // // Convolutional layers (* 2).
-        // int8_t* conved1_ptr = conv_pad_q(q, 3, 224, input_ptr, weights1, 64, biases1, 0.01979798823595047, 0.013484773226082325, 0.04881289601325989);
-        // int8_t* pooled1_ptr = max_pool_q(q, 64, 224, 224, conved1_ptr);
-        // int8_t* conved2_ptr = conv_pad_q(q, 64, 112, pooled1_ptr, weights2, 512, biases2, 0.04881289601325989, 0.0006907337228767574, 0.016132580116391182);
-        // int8_t* pooled2_ptr = max_pool_q(q, 512, 112, 112, conved2_ptr);
+            Conv1FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+            // write to unique pipes (img_dim x con1_dim of them) where next kernel reads from img_dim pipes
+
+            // for (int i =0; i < img_dim / 2; i++){
+            //     std::array<int8_t, img_burst_size> img_burst = Quant1Pipes::PipeAt<ID,0>::read();
+            //     #pragma unroll
+            //     for (int k =0; k < img_burst_size; k++){
+            //         input[ID*img_size + i*img_burst_size+k] = img_burst[k];
+            //     }
+            // }
+        });
+        cout << "Pipelined to ConvAcc" << std::endl;
+        // q.wait();
+        // for (int i =0; i < img_size*img_chn; i++){
+        //     if (input[i] != input_old[i]){
+        //         cout << input[i] << " vs " << input_old << " old\n";
+        //     }
+        // }
+
+        // Enqueue CONVACC kernals for each channel ################################################
+        SubmitComputeUnits<c1_chn, Conv1AccComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+            device_ptr<int32_t> bias_d(conv1_b_ptr);
+            for (int i = 0; i < img_dim; i++){
+                int32_t *bursts[img_chn];
+                fpga_tools::UnrolledLoop<img_chn>([&ID, &bursts](auto CID){
+                    bursts[CID] = &Conv1FilterPipes::PipeAt<CID, ID>::read()[0];
+                });
+                std::array<int8_t, conv1_burst_size> out_burst;
+                #pragma unroll
+                for (int cur =0; cur < img_dim; cur++){
+                    int32_t sum = 0;
+                    #pragma unroll
+                    for (int c = 0 ; c < img_chn; c++){
+                        sum += bursts[c][cur];
+                    }
+                    sum += bias_d[ID];
+                    out_burst[cur] = sum > 0 ? round(sum * scale) : 0;
+                }
+                Conv1AccPipes::PipeAt<ID>::write(out_burst);
+            }
+        });
+        cout << "Pipelined to MaxPool" << std::endl;
+
+        // Enqueue MAXPOOl kernals for each channel ################################################
+        SubmitComputeUnits<c1_chn, MaxPool1ComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+            for (int i = 0; i < c1_dim / 2; i++){
+                std::array<int8_t, pool1_burst_size> out_burst;
+                for (int k = 0; k < 2; k++){
+                    std::array<int8_t, conv1_burst_size> in_burst = Conv1AccPipes::PipeAt<ID>::read();
+                    for (int j = 0; j < c1_dim; j++){
+                        out_burst[k*c1_dim+j] = sycl::max(in_burst[j], in_burst[j+1]);
+                    }
+                    in_burst = Conv1AccPipes::PipeAt<ID>::read();
+                    for (int j = 0; j < c1_dim; j++){
+                        out_burst[k*c1_dim+j] = sycl::max(out_burst[k*c1_dim+j],sycl::max(in_burst[j], in_burst[j+1]));
+                    }
+                }
+                fpga_tools::UnrolledLoop<c2_chn>([&ID, out_burst](auto PID){
+                    Pool1Pipes::PipeAt<ID,PID>::write(out_burst);
+                });
+            }
+        });
+
+        // Enqueue CONVFILTER kernals for each channel ################################################
+        SubmitComputeUnits<c1_chn*c2_chn, Conv2FilterComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+            device_ptr<int8_t> filter_d(conv2_f_ptr);
+            constexpr int in_chn = ID / c2_chn;
+            constexpr int out_chn = ID % c2_chn;
+            int8_t *filter = &filter_d[out_chn*c1_chn*filter_size + in_chn*filter_size];
+            
+            std::array<int8_t, pool1_burst_size> in_burst = Pool1Pipes::PipeAt<in_chn, out_chn>::read();
+            std::array<int32_t, conv2_burst_size> out_burst;
+
+            conv_top_row<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, filter, out_burst);
+            Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+
+            std::array<int8_t, pool1_burst_size> last_burst = in_burst;
+            for (int i = 0; i < (c1_dim / 2) - 1; i++){
+                in_burst = Pool1Pipes::PipeAt<in_chn, out_chn>::read();
+                std::array<int32_t, conv2_burst_size> out_burst;
+
+                conv_middle_rows<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, last_burst, filter, out_burst);
+
+                Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+                last_burst = in_burst;
+                
+            }
+            conv_bottom_row<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, filter, out_burst);
+
+            Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+        });
+
+        // Enqueue CONVACC kernals for each channel ################################################
+        SubmitComputeUnits<c2_chn, Conv2AccComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+            device_ptr<int32_t> bias_d(conv2_b_ptr);
+            for (int i = 0; i < c1_dim; i++){
+                int32_t *bursts[c1_chn];
+                fpga_tools::UnrolledLoop<c1_chn>([&ID, &bursts](auto CID){
+                    bursts[CID] = &Conv2FilterPipes::PipeAt<CID, ID>::read()[0];
+                });
+                std::array<int8_t, conv2_burst_size> out_burst;
+                #pragma unroll
+                for (int cur =0; cur < c2_dim; cur++){
+                    int32_t sum = 0;
+                    #pragma unroll
+                    for (int c = 0 ; c < c2_chn; c++){
+                        sum += bursts[c][cur];
+                    }
+                    sum += bias_d[ID];
+                    out_burst[cur] = sum > 0 ? round(sum * scale) : 0;
+                }
+                Conv2AccPipes::PipeAt<ID>::write(out_burst);
+            }
+        });
+
+        // Enqueue MAXPOOl kernals for each channel ################################################
+        SubmitComputeUnits<c2_chn, MaxPool2ComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+            for (int i = 0; i < c2_dim; i++){
+                std::array<int8_t, pool2_burst_size> out_burst;
+
+                std::array<int8_t, conv2_burst_size> in_burst = Conv2AccPipes::PipeAt<ID>::read();
+                for (int j = 0; j < c2_dim; j++){
+                    out_burst[c2_dim+j] = sycl::max(in_burst[j], in_burst[j+1]);
+                }
+                in_burst = Conv2AccPipes::PipeAt<ID>::read();
+                for (int j = 0; j < c2_dim; j++){
+                    out_burst[c2_dim+j] = sycl::max(out_burst[c2_dim+j],sycl::max(in_burst[j], in_burst[j+1]));
+                }
+            
+                Pool2Pipes::PipeAt<ID>::write(out_burst);
+            }
+        });
+
+        // Enqueue DEQUANTISATION kernals for each channel ################################################
+        SubmitComputeUnits<c2_chn, DequantComputeUnits>(q, [=](auto ID) [[intel::kernel_args_restrict]]{
+            for (int burst_idx = 0; burst_idx < c2_dim; burst_idx++ ){
+                std::array<int8_t, pool2_burst_size> in_burst;
+                std::array<float, dequant_burst_size> out_burst;
+                
+                #pragma unroll
+                for (int k = 0; k < dequant_burst_size; k++){
+                    out_burst[k] = in_burst[burst_idx * pool2_burst_size + k] * img_scale;
+                }
+                fpga_tools::UnrolledLoop<num_protos>([&ID, out_burst](auto PID){
+                    DequantPipes::PipeAt<ID, PID>::write(out_burst);
+                });
+            }
+        });
+
         // float *pooled2_f_ptr = dequant(q, 512 * 56 * 56, 0.016132580116391182, pooled2_ptr);
 
         // // Prototype layer.
@@ -17615,14 +17975,3 @@ int main()
 
     return 0;
 }
-
-// template <int in_chn,
-//           int in_dim,
-//           int out_chn,
-//           int k_size,
-//           typename InputPipe
-//           >
-// void ConvCorners (int8_t *filter_ptr, int32_t *bias_ptr, float scale, int8_t* result_ptr) {
-//     device_ptr<int8_t> filter_d(filter_ptr);
-//     device_ptr<int32_t> bias_d(bias_ptr);
-//     device_ptr<int8_t> result_d(result_ptr);
