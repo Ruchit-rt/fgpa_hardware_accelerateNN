@@ -17,6 +17,9 @@ using namespace sycl;
 // Number of iterations.
 #define N 1
 
+template <std::size_t ID> class Conv1ID;
+template <std::size_t ID> class Conv2ID;
+
 // The test input, a flattened and normalised 3 * 448 * 448 image. It is a picture of a carrot.
 float input_f[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.5451, 0.5569,
                    0.5490, 0.5765, 0.5922, 0.5725, 0.5686, 0.5686, 0.5451, 0.5451, 0.5333,
@@ -16891,9 +16894,9 @@ float* dequant(queue &q, int size, float scale, int8_t *tensor_ptr)
 
     return result_ptr;
 }
-
+template <template <std::size_t ID> typename Name, int chn, int size, int d>
 /* Carry out quantised convolution (with padding) between the TENSOR (1 * CHN * W * W) and the FILTER (D * CHN * 3 * 3), then ReLU. */
-int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filter, int d, int32_t *biases, float tensor_scale, float filter_scale, float result_scale)
+int8_t* conv_pad_q(queue &q, int8_t *tensor_ptr, int8_t *filter, int32_t *biases, float tensor_scale, float filter_scale, float result_scale)
 {
     int8_t* filter_ptr = (int8_t*) malloc_device(d * chn * 9 * sizeof(int8_t), q);
     int32_t* bias_ptr = (int32_t*) malloc_device(d * sizeof(int32_t), q);
@@ -16907,7 +16910,7 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
         h.depends_on(filter_to_device_event);
         h.depends_on(bias_to_device_event);
         
-        h.single_task<class ConvCornerID>([=]() [[intel::kernel_args_restrict]]{
+        h.single_task<Name<0>>([=]() [[intel::kernel_args_restrict]]{
             device_ptr<int8_t> tensor_d(tensor_ptr);
             device_ptr<int8_t> filter_d(filter_ptr);
             device_ptr<int32_t> bias_d(bias_ptr);
@@ -16971,7 +16974,7 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
         h.depends_on(filter_to_device_event);
         h.depends_on(bias_to_device_event);
 
-        h.single_task<class ConvBoundID>([=]() {
+        h.single_task<Name<1>>([=]() {
             device_ptr<int8_t> tensor_d(tensor_ptr);
             device_ptr<int8_t> filter_d(filter_ptr);
             device_ptr<int32_t> bias_d(bias_ptr);
@@ -16980,65 +16983,66 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
             const float scale = tensor_scale * filter_scale / result_scale;
             for (int i = 0; i < d * (size - 2); i++) {
                 int index[2] = { i / (size - 2), i % (size - 2) };
-                int32_t sum = 0;
+                int32_t sum1 = 0;
+                #pragma unroll
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
                     #pragma unroll
                     for (int i = 0; i <= 1; i++) {
                         #pragma unroll
                         for (int j = 0; j <= 2; j++) {
-                            sum += filter_d[_fi * 9 + (i+1) * 3 + j] * tensor_d[c * size * size + (i * size) + index[1] + j];
+                            sum1 += filter_d[_fi * 9 + (i+1) * 3 + j] * tensor_d[c * size * size + (i * size) + index[1] + j];
                         }
                     }
                 }
 
-                sum += bias_d[index[0]];
-                result_d[index[0] * size * size + index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+                sum1 += bias_d[index[0]];
+                result_d[index[0] * size * size + index[1] + 1] = sum1 > 0 ? round(sum1 * scale) : 0;
 
-                sum = 0;
+                int32_t sum2 = 0;
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
                     #pragma unroll
                     for (int i = -2; i <= -1; i++) {
                         #pragma unroll
                         for (int j = 0; j <= 2; j++) {
-                            sum += filter_d[_fi * 9 + (i + 2) * 3 + j] * tensor_d[c * size * size + (size + i) * size + index[1] + j];      
+                            sum2 += filter_d[_fi * 9 + (i + 2) * 3 + j] * tensor_d[c * size * size + (size + i) * size + index[1] + j];      
                         }
                     }
                 }
 
-                sum += bias_d[index[0]];
-                result_d[index[0] * size * size + (size - 1) * size + index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+                sum2 += bias_d[index[0]];
+                result_d[index[0] * size * size + (size - 1) * size + index[1] + 1] = sum2 > 0 ? round(sum2 * scale) : 0;
 
-                sum = 0;
+                int32_t sum3 = 0;
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
                     #pragma unroll
                     for (int i = 0; i <= 2; i++) {
                         #pragma unroll
                         for (int j = 0; j <= 1; j++) {
-                            sum += filter_d[_fi * 9 + i * 3 + j + 1] * tensor_d[c * size * size + (index[1] + i) * size + j];        
+                            sum3 += filter_d[_fi * 9 + i * 3 + j + 1] * tensor_d[c * size * size + (index[1] + i) * size + j];        
                         }
                     }
                 }
 
-                sum += bias_d[index[0]];
-                result_d[index[0] * size * size + (index[1] + 1) * size] = sum > 0 ? round(sum * scale) : 0;
+                sum3 += bias_d[index[0]];
+                result_d[index[0] * size * size + (index[1] + 1) * size] = sum3 > 0 ? round(sum3 * scale) : 0;
 
-                sum = 0;
+                int32_t sum4 = 0;
                 for (int c = 0; c < chn; c++) {
                     int _fi = index[0] * chn + c;
                     #pragma unroll
                     for (int i = 0; i <= 2; i++) {
                         #pragma unroll
                         for (int j = -2; j <= -1; j++) {
-                        sum += filter_d[_fi * 9 + i * 3 + j + 2] * tensor_d[c * size * size + (index[1] + i) * size + size + j];        
+                        sum4 += filter_d[_fi * 9 + i * 3 + j + 2] * tensor_d[c * size * size + (index[1] + i) * size + size + j];        
                         }
                     }
                 }
 
-                sum += bias_d[index[0]];
-                result_d[index[0] * size * size + (index[1] + 1) * size + size - 1] = sum > 0 ? round(sum * scale) : 0;
+                sum4 += bias_d[index[0]];
+                result_d[index[0] * size * size + (index[1] + 1) * size + size - 1] = sum4 > 0 ? round(sum4 * scale) : 0;
             }
         });
     });
@@ -17048,7 +17052,7 @@ int8_t* conv_pad_q(queue &q, int chn, int size, int8_t *tensor_ptr, int8_t *filt
         h.depends_on(filter_to_device_event);
         h.depends_on(bias_to_device_event);
 
-        h.single_task<class ConvIntrID>([=]() {
+        h.single_task<Name<2>>([=]() {
             device_ptr<int8_t> tensor_d(tensor_ptr);
             device_ptr<int8_t> filter_d(filter_ptr);
             device_ptr<int32_t> bias_d(bias_ptr);
@@ -17147,8 +17151,11 @@ float* l2_distance(queue &q, int chn, int length, float *tensor_ptr, int p_len, 
             for (int proto_idx = 0; proto_idx < p_len; proto_idx++){
                 for (int feat_idx = 0; feat_idx < length; feat_idx++){
                     float sum = 0.0f;
+                    int p = proto_idx * chn;
+                    #pragma clang contract(fast)
                     for (int c = 0; c < chn; c++) {
-                        float dist = tensor_d[c * length + feat_idx] - proto_d[proto_idx * chn + c];
+
+                        float dist = tensor_d[c * length + feat_idx] - proto_d[p + c];
                         sum += dist*dist;
                     }
                     result_d[proto_idx * length + feat_idx] = sycl::sqrt(sum);
@@ -17447,6 +17454,11 @@ int main()
                 << std::endl;
       std::terminate();
     }
+    if (!device.get_info<info::device::usm_host_allocations>()) {
+      std::cerr << "ERROR: The selected device does not support USM host"
+                << " allocations\n";
+      std::terminate();
+    }
 
     std::cout << "Running on device: "
               << device.get_info<sycl::info::device::name>().c_str()
@@ -17472,18 +17484,6 @@ int main()
 
     rf_data.close();
 
-    // Allocate memories for intermediate computations.
-    // int8_t *input = new int8_t[3 * 448 * 448];
-    // int8_t *conved1 = new int8_t[64 * 224 * 224];
-    // int8_t *pooled1 = new int8_t[64 * 112 * 112];
-    // int8_t *conved2 = new int8_t[512 * 112 * 112];
-    // int8_t *pooled2 = new int8_t[512 * 56 * 56];
-    // float *pooled2_f = new float[512 * 56 * 56];
-    // float *distances_f = new float[15 * 56 * 56];
-    // float *similarities_f = new float[15 * 56 * 56];
-    // float *avg_f = new float[15];
-    // int8_t *avg = (int8_t *)avg_f;
-    // int8_t *logits = new int8_t[3];
     float *logits_f = new float[3];
     float *upsampled_f = new float[15 * 224 * 224];
 
@@ -17503,9 +17503,9 @@ int main()
         int8_t* input_ptr = quant(q, 3 * 224 * 224, 0.01979798823595047, input_f_ptr);
 
         // Convolutional layers (* 2).
-        int8_t* conved1_ptr = conv_pad_q(q, 3, 224, input_ptr, weights1, 64, biases1, 0.01979798823595047, 0.013484773226082325, 0.04881289601325989);
+        int8_t* conved1_ptr = conv_pad_q<Conv1ID, 3, 224, 64>(q, input_ptr, weights1, biases1, 0.01979798823595047, 0.013484773226082325, 0.04881289601325989);
         int8_t* pooled1_ptr = max_pool_q(q, 64, 224, 224, conved1_ptr);
-        int8_t* conved2_ptr = conv_pad_q(q, 64, 112, pooled1_ptr, weights2, 512, biases2, 0.04881289601325989, 0.0006907337228767574, 0.016132580116391182);
+        int8_t* conved2_ptr = conv_pad_q<64>(q, 112, pooled1_ptr, weights2, 512, biases2, 0.04881289601325989, 0.0006907337228767574, 0.016132580116391182);
         int8_t* pooled2_ptr = max_pool_q(q, 512, 112, 112, conved2_ptr);
         float *pooled2_f_ptr = dequant(q, 512 * 56 * 56, 0.016132580116391182, pooled2_ptr);
 
