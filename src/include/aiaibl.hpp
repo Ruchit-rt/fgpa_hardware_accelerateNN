@@ -201,36 +201,53 @@ void Conv (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale
     device_ptr<int8_t> result_d(result_ptr);
 
     constexpr int buff_dim = in_dim+2;
+    constexpr int chn_filter_size = in_chn*k_size;
+    constexpr int shift_reg_s = 3*buff_dim;
 
     for (int outc = 0; outc < out_chn; outc++){
 
         for (int inc = 0; inc < in_chn; inc++){
 
             [[intel::fpga_register]] int kernel[k_size];
+            #pragma unroll
             for (int i = 0; i < k_size; i++){
-                kernel[i] = filter_d[outc*in_chn*k_size + inc*k_size];
+                kernel[i] = filter_d[outc*chn_filter_size + inc*k_size];
             }
 
             // initialise shift_reg
-            int8_t shift_reg[3*(in_dim+2)];
-            for (int i = 0; i < 3*(in_dim+2); i++){
+            int8_t shift_reg[shift_reg_s];
+            #pragma unroll
+            for (int i = 0; i < shift_reg_s; i++){
                 shift_reg[i] = 0;
             }
-            // for each row
-            for (int y = 0; y < in_dim; y++){
+
+            // Load shift_reg with 1st row
+
+            // place new row with padding
+            #pragma unroll
+            for (int x = 0; x < in_dim; x++){
+                shift_reg[2*buff_dim+1+x] = input_d[inc*in_dim*in_dim + x];
+            }
+            
+            // Place rows and convolve previous row
+            for (int y = 1; y < in_dim; y++){
 
                 // shift left by one row
                 #pragma unroll
-                for (int i = 0; i < 2*(in_dim+2); i++){
-                    shift_reg[i] = shift_reg[i+(in_dim+2)];
+                for (int j = 0; j < in_dim; j++){
+                    #pragma unroll
+                    for (int i = 0; i < shift_reg_s; i++){
+                        shift_reg[i] = shift_reg[i+1];
+                    }
                 }
 
                 // place new row
-                shift_reg[2*(in_dim+2)] = 0;
+                shift_reg[2*buff_dim] = 0;
+                #pragma unroll
                 for (int x = 0; x < in_dim; x++){
-                    shift_reg[2*(in_dim+2)+1+x] = input_d[inc*in_dim*in_dim + y*in_dim + x];
+                    shift_reg[2*buff_dim+1+x] = input_d[inc*in_dim*in_dim + y*in_dim + x];
                 }
-                shift_reg[3*(in_dim+2)-1] = 0;
+                shift_reg[shift_reg_s-1] = 0;
 
                 //calcualte new row
                 for (int x = 0; x < in_dim; x++){
@@ -242,8 +259,39 @@ void Conv (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale
                             sum += shift_reg[y_off*buff_dim + x_off + x] * filter_d[outc * kernel[y_off*3+x_off]];
                         }
                     }
-                    result_d[outc*in_dim*in_dim + y*in_dim + x] = sum > 0 ? round(sum * scale) : 0;
+                    result_d[outc*in_dim*in_dim + (y-1)*in_dim + x] = sum > 0 ? round(sum * scale) : 0;
                 }
+            }
+
+            //Insert final padding layer and convolve last row
+
+            // shift left by one row
+            // shift left by one row
+                #pragma unroll
+                for (int j = 0; j < in_dim; j++){
+                    #pragma unroll
+                    for (int i = 0; i < shift_reg_s; i++){
+                        shift_reg[i] = shift_reg[i+1];
+                    }
+                }
+
+            // place new row
+            #pragma unroll
+            for (int x = 0; x < buff_dim; x++){
+                shift_reg[2*buff_dim+x] = 0;
+            }
+
+            //calcualte new row
+            for (int x = 0; x < in_dim; x++){
+                int32_t sum = bias_d[outc];
+                #pragma unroll
+                for (int y_off = 0; y_off < 3; y_off++){
+                    #pragma unroll
+                    for (int x_off = 0; x_off < 3; x_off++){
+                        sum += shift_reg[y_off*buff_dim + x_off + x] * filter_d[outc * kernel[y_off*3+x_off]];
+                    }
+                }
+                result_d[outc*in_dim*in_dim + (in_dim-1)*in_dim + x] = sum > 0 ? round(sum * scale) : 0;
             }
 
         }
