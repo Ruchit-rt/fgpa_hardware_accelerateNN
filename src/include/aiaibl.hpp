@@ -169,24 +169,27 @@ void ConvInterior (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, flo
     device_ptr<int32_t> bias_d(bias_ptr);
     device_ptr<int8_t> result_d(result_ptr);
 
-    for (int i = 0; i < (in_dim - 2) * (in_dim - 2); i++){
-        int index[3] = { i / ((in_dim - 2) * (in_dim - 2)), (i / (in_dim -2)) % (in_dim - 2), i % (in_dim - 2) };
-        int32_t sum = 0;
-        #pragma unroll 2 // Partial unrolling for the outermost loop.
-        for (int c = 0; c < in_chn; c++) {
-            int _fi = index[0] * in_chn + c;
-            #pragma unroll
-            for (int i = 0; i <= 2; i++) {
-                #pragma unroll
-                for (int j = 0; j <= 2; j++) {
-                    sum += filter_d[_fi * k_size + i * 3 + j] * input_d[c * in_dim * in_dim + (index[1] + i) * in_dim + index[2] + j];        
+    for (int outc = 0; outc < out_chn; outc++){
+        for (int y = 0; y < in_dim-2; y++){
+            for (int x = 0; x < in_dim-2; x++){
+                int32_t sum = 0;
+                for (int c = 0; c < in_chn; c++) {
+                    int _fi = outc * in_chn + c;
+                    #pragma unroll
+                    for (int i = 0; i <= 2; i++) {
+                        #pragma unroll
+                        for (int j = 0; j <= 2; j++) {
+                            sum += filter_d[_fi * k_size + i * 3 + j] * input_d[c * in_dim * in_dim + (y + i) * in_dim + x + j];        
+                        }
+                    }
                 }
+
+                sum += bias_d[outc];
+                result_d[outc * in_dim * in_dim + (y + 1) * in_dim + x + 1] = sum > 0 ? round(sum * scale) : 0;
             }
         }
-
-        sum += bias_d[index[0]];
-        result_d[index[0] * in_dim * in_dim + (index[1] + 1) * in_dim + index[2] + 1] = sum > 0 ? round(sum * scale) : 0;
     }
+
 }
 
 template <int in_chn,
@@ -195,6 +198,46 @@ template <int in_chn,
           int k_size
           >
 void Conv (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale, int8_t* result_ptr){
+    #pragma clang fp contract(fast)
+    device_ptr<int8_t> input_d(input_ptr);
+    device_ptr<int8_t> filter_d(filter_ptr);
+    device_ptr<int32_t> bias_d(bias_ptr);
+    device_ptr<int8_t> result_d(result_ptr);
+    constexpr int in_str_dim = in_dim-2;
+
+    for (int outc = 0; outc < out_chn; outc++){
+        for (int y = 0; y < in_str_dim; y++){
+            [[intel::ivdep]]
+            for (int x = 0; x < in_str_dim; x++){
+                int32_t sum = 0;
+                #pragma unroll 2
+                for (int c = 0; c < in_chn; c++) {
+                    const int _fi = (outc * in_chn + c) * k_size;
+                    const int _c = c * in_dim * in_dim;
+                    #pragma unroll
+                    for (int i = 0; i <= 2; i++) {
+                        const int _i = i * 3;
+                        const int _y = (y + i) * in_dim + x;
+                        #pragma unroll
+                        for (int j = 0; j <= 2; j++) {
+                            sum += filter_d[_fi + _i + j] * input_d[_c + _y + j];        
+                        }
+                    }
+                }
+
+                sum += bias_d[outc];
+                result_d[outc * in_str_dim * in_str_dim + y * in_str_dim + x] = sum > 0 ? round(sum * scale) : 0;
+            }
+        }
+    }
+}
+
+template <int in_chn,
+          int in_dim,
+          int out_chn,
+          int k_size
+          >
+void Conv_reg_shift (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale, int8_t* result_ptr){
     device_ptr<int8_t> input_d(input_ptr);
     device_ptr<int8_t> filter_d(filter_ptr);
     device_ptr<int32_t> bias_d(bias_ptr);
@@ -300,6 +343,7 @@ void Conv (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale
 
 template <int chn, int in_dim>
 void MaxPool(int8_t *input_ptr, int8_t *result_ptr){
+    #pragma clang fp contract(fast)
     device_ptr<int8_t> in_d(input_ptr);
     device_ptr<int8_t> result_d(result_ptr);
 
@@ -307,6 +351,7 @@ void MaxPool(int8_t *input_ptr, int8_t *result_ptr){
     for (int c = 0; c < chn; c++){
         for (int y = 0; y < out_dim; y++){
             #pragma unroll 2
+            [[intel::ivdep]]
             for (int x = 0; x < out_dim; x++){
                 int8_t res = sycl::max(in_d[c*in_dim*in_dim + y*in_dim + x], in_d[c*in_dim*in_dim + y*in_dim + x]);
                 res = sycl::max(res, in_d[c*in_dim*in_dim + (y+1)*in_dim + x]);

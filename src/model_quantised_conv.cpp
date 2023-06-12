@@ -90,16 +90,18 @@ int main()
     /*
     Allocate memory and copy onto device for the network parameters and layers 
     */
-    float* img_f_ptr = malloc_device<float>(img_size, q);
-    int8_t* img_ptr = (int8_t*) malloc_device(img_size * sizeof(int8_t), q);
-
+    float* img_f_ptr = malloc_host<float>(img_size, q);
+    int8_t* img_ptr = (int8_t*) malloc_device(img_pad_size * sizeof(int8_t), q);
+    // for (int i = 0; i < img_pad_size; i++) img_ptr[i] = 0;
+    
     int8_t* conv1_f_ptr = (int8_t*) malloc_device(c1_chn * img_chn * filter_size * sizeof(int8_t), q);
     int32_t* conv1_b_ptr = (int32_t*) malloc_device(img_chn * sizeof(int32_t), q);
     int8_t* conved1_ptr = (int8_t*) malloc_device(c1_chn * img_dim * img_dim * sizeof(int8_t), q);
     auto filter1_to_device_event = q.memcpy(conv1_f_ptr, &weights1[0], c1_chn * img_chn * filter_size * sizeof(int8_t));
     auto bias1_to_device_event = q.memcpy(conv1_b_ptr, &biases1[0], img_chn * sizeof(int32_t));
 
-    int8_t* pooled1_ptr = (int8_t*) malloc_device(c1_chn * c1_dim * c1_dim * sizeof(int8_t), q);
+    int8_t* pooled1_ptr = (int8_t*) malloc_device(c1_chn * c1_pad_dim * c1_pad_dim * sizeof(int8_t), q);
+    // for (int i = 0; i < c1_chn*c1_pad_dim*c1_pad_dim; i++) pooled1_ptr[i] = 0;
 
     int8_t* conv2_f_ptr = (int8_t*) malloc_device(c2_chn * c1_chn * filter_size * sizeof(int8_t), q);
     int32_t* conv2_b_ptr = (int32_t*) malloc_device(c1_chn * sizeof(int32_t), q);
@@ -122,6 +124,9 @@ int main()
     auto weights_to_device_event = q.memcpy(weights_ptr, &fc_weights[0], num_classes * num_protos * sizeof(int8_t));
 
     float* upsample_ptr = (float*) malloc_device(num_protos*img_dim*img_dim*sizeof(float), q);
+
+    cout << "Pointers initialised\n";
+
     // Timings.
     double times[N] = {};
 
@@ -129,23 +134,25 @@ int main()
     {
         auto start = high_resolution_clock::now();
 
-        //Copy input image into device (TODO: stream from host instead)
-        auto img_to_device_event = q.memcpy(img_f_ptr, &input_f[0], img_size * sizeof(float));
+        // Copy input image into device (TODO: stream from host instead)
         /*
             Quantise the image
         */
         auto quant_event = q.submit([&](handler &h) {
-            h.depends_on(img_to_device_event);
             h.single_task<class Quantise>([=]() [[intel::kernel_args_restrict]]{
-                device_ptr<float> img_d(img_f_ptr);
+                host_ptr<float> img_d(img_f_ptr);
                 device_ptr<int8_t> result_d(img_ptr);
 
-                for (int i = 0; i < img_size; i++){
-                    result_d[i] = round(img_d[i] / 0.01979798823595047);
+                for(int c = 0; c < img_chn; c++){
+                    for (int y = 0; y < img_dim; y++){
+                        [[intel::ivdep]]
+                        for (int x = 0; x < img_dim; x++){
+                            result_d[c*img_pad_chn_size + (1+y)*img_pad_dim + x+1] = round(img_d[c*img_chn_size+ y*img_dim + x] / 0.01979798823595047);
+                        }
+                    }
                 }
             });
         });
-
         
         /*
             Convolute image with 3x3xc1_chn filter and zero-padding, quantise and ReLU output features
@@ -157,28 +164,8 @@ int main()
             h.depends_on(filter1_to_device_event);
             h.depends_on(bias1_to_device_event);
             
-            h.single_task<class Conv1Corner>([=]() [[intel::kernel_args_restrict]]{
-                ConvCorners<img_chn,img_dim,c1_chn,filter_size>(img_ptr, conv1_f_ptr, conv1_b_ptr, c1_scale, conved1_ptr);
-            });
-        });
-
-        auto c1_boundry_event = q.submit([&](handler &h) {
-            h.depends_on(quant_event);
-            h.depends_on(filter1_to_device_event);
-            h.depends_on(bias1_to_device_event);
-
-            h.single_task<class Conv1Bound>([=]() [[intel::kernel_args_restrict]]{
-                ConvBoundry<img_chn,img_dim,c1_chn, filter_size>(img_ptr, conv1_f_ptr, conv1_b_ptr, c1_scale, conved1_ptr);
-            });
-        });
-
-        auto c1_interior_event = q.submit([&](handler &h) {
-            h.depends_on(quant_event);
-            h.depends_on(filter1_to_device_event);
-            h.depends_on(bias1_to_device_event);
-
-            h.single_task<class Conv1Interior>([=]() [[intel::kernel_args_restrict]]{
-                ConvInterior<img_chn,img_dim,c1_chn, filter_size>(img_ptr, conv1_f_ptr, conv1_b_ptr, c1_scale, conved1_ptr);
+            h.single_task<class Conv1>([=]() [[intel::kernel_args_restrict]]{
+                Conv<img_chn,img_pad_dim,c1_chn,filter_size>(img_ptr, conv1_f_ptr, conv1_b_ptr, c1_scale, conved1_ptr);
             });
         });
 
@@ -187,14 +174,27 @@ int main()
         */
         auto pool1_event = q.submit([&](handler &h) {
             h.depends_on(c1_corner_event);
-            h.depends_on(c1_boundry_event);
-            h.depends_on(c1_interior_event);
-            
+
             h.single_task<class Maxpool1>([=]() [[intel::kernel_args_restrict]]{
-                MaxPool<c1_chn, img_dim>(conved1_ptr, pooled1_ptr);
+                device_ptr<int8_t> in_d(conved1_ptr);
+                device_ptr<int8_t> result_d(pooled1_ptr);
+
+                constexpr int out_dim = img_dim / 2;
+                for (int c = 0; c < c1_chn; c++){
+                    constexpr int _c = (out_dim+2)*(out_dim+2);
+                    for (int y = 0; y < out_dim; y++){
+                        #pragma unroll 2
+                        [[intel::ivdep]]
+                        for (int x = 0; x < out_dim; x++){
+                            int8_t res = sycl::max(in_d[c*img_dim*img_dim + y*img_dim + x], in_d[c*img_dim*img_dim + y*img_dim + x]);
+                            res = sycl::max(res, in_d[c*img_dim*img_dim + (y+1)*img_dim + x]);
+                            res = sycl::max(res, in_d[c*img_dim*img_dim + (y+1)*img_dim + x + 1]);
+                            result_d[_c*c + (y+1)*(out_dim+2) + x+1] = res;
+                        }
+                    }
+                }
             });
         });
-
 
         /*
             Convolute image with 3x3xc2_chn filter and zero-padding, quantise and ReLU output features
@@ -205,28 +205,8 @@ int main()
             h.depends_on(filter2_to_device_event);
             h.depends_on(bias2_to_device_event);
             
-            h.single_task<class Conv2Corner>([=]() [[intel::kernel_args_restrict]]{
-                ConvCorners<c1_chn,c1_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
-            });
-        });
-
-        auto c2_boundry_event = q.submit([&](handler &h) {
-            h.depends_on(pool1_event);
-            h.depends_on(filter2_to_device_event);
-            h.depends_on(bias2_to_device_event);
-
-            h.single_task<class Conv2Bound>([=]() [[intel::kernel_args_restrict]]{
-                ConvBoundry<c1_chn,c1_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
-            });
-        });
-
-        auto c2_interior_event = q.submit([&](handler &h) {
-            h.depends_on(pool1_event);
-            h.depends_on(filter2_to_device_event);
-            h.depends_on(bias2_to_device_event);
-
-            h.single_task<class Conv2Interior>([=]() [[intel::kernel_args_restrict]]{
-                ConvInterior<c1_chn,c1_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
+            h.single_task<class Conv2>([=]() [[intel::kernel_args_restrict]]{
+                Conv<c1_chn,c1_pad_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
             });
         });
 
@@ -235,8 +215,6 @@ int main()
         */
         auto pool2_event = q.submit([&](handler &h) {
             h.depends_on(c2_corner_event);
-            h.depends_on(c2_boundry_event);
-            h.depends_on(c2_interior_event);
             
             h.single_task<class Maxpool2>([=]() [[intel::kernel_args_restrict]]{
                 MaxPool<c2_chn, c1_dim>(conved2_ptr, pooled2_ptr);
@@ -252,6 +230,7 @@ int main()
                 device_ptr<int8_t> in_d(pooled2_ptr);
                 device_ptr<float> result_d(fm_ptr);
 
+                [[intel::ivdep]]
                 for (int i = 0; i < c2_chn*c2_dim*c2_dim; i++){
                     result_d[i] = in_d[i] * 0.016132580116391182;
                 }
@@ -266,18 +245,21 @@ int main()
             h.depends_on(dequant_event);
 
             h.single_task<class SimMap>([=]() [[intel::kernel_args_restrict]]{
+                #pragma clang fp contract(fast)
                 device_ptr<float> in_d(fm_ptr);
                 device_ptr<float> proto_d(proto_ptr);
                 device_ptr<float> res_d(sims_ptr);
 
-                #pragma unroll 10
                 for (int p = 0; p < num_protos; p++){
+                    const int _p = p*c2_chn;
                     for (int y = 0; y < c2_dim; y++){
                         for (int x = 0; x < c2_dim; x++){
+                            const int _y = y*c2_dim + x;
                             float res = 0.0f;
                             #pragma unroll 2
+                            [[intel::ivdep]]
                             for (int c = 0; c < c2_chn; c++){
-                                float dist = in_d[c*c2_dim*c2_dim + y*c2_dim + x] - proto_d[p*c2_chn+c];
+                                float dist = in_d[c*c2_chn_size + _y] - proto_d[_p+c];
                                 res += dist*dist;
                             }
                             res = sycl::sqrt(res);
@@ -301,6 +283,7 @@ int main()
                 for (int index = 0; index < num_protos; index++){
                     // auto _q = (index[1] + 2) / 4;
                     for (int i = 0; i < 2; i++) {
+                        [[intel::ivdep]]
                         for (int j = 0; j < 2; j++){
                             result_d[(index*c2_dim*c2_dim) + (i * c2_dim) + j] = tensor_d[index * c2_dim * c2_dim];
                             result_d[(index * c2_dim * c2_dim) + (i * c2_dim) + 4 * c2_dim - 1 - j] = tensor_d[(index * c2_dim * c2_dim) + c2_dim - 1];
@@ -459,12 +442,8 @@ int main()
 
         print_exec_time(quant_event, "Quant");
         print_exec_time(c1_corner_event, "C1 Corner");
-        print_exec_time(c1_boundry_event, "C1 Boundry");
-        print_exec_time(c1_interior_event, "C1 Intr");
         print_exec_time(pool1_event, "Pool1");
         print_exec_time(c2_corner_event, "C2 Corner");
-        print_exec_time(c2_boundry_event, "C2 Boundry");
-        print_exec_time(c2_interior_event, "C2 Intr");
         print_exec_time(pool2_event, "Pool2");
         print_exec_time(dequant_event, "Dequant");
         print_exec_time(similarity_event, "Similarity");
@@ -486,9 +465,6 @@ int main()
     // });
     // logits_to_host.wait();
 
-    
-
-
     free(img_f_ptr, q);
     free(img_ptr, q);
     free(conv1_f_ptr, q);
@@ -506,10 +482,10 @@ int main()
     free(weights_ptr, q);
     free(logits_ptr, q);
 
-    // //Print out the output.
-    // peek(1, 3, &logits[0], true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
+    //Print out the output.
+    peek(1, 3, &logits[0], true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
     // // peek(1, 15, avg_f, false);
-    // peek(224, 224, &upsample[0], true);
+    peek(224, 224, &upsample[0], true);
     // peek(224, 224, upsampled_f + 224 * 224, true);
     // peek(224, 224, upsampled_f + 14 * 224 * 224, true);
 
@@ -529,6 +505,5 @@ int main()
     delete[] biases2;
     delete[] prototypes;
     delete[] fc_weights;
-
     return 0;
 }
