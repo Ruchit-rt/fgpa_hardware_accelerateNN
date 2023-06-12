@@ -251,7 +251,14 @@ int main()
                 device_ptr<float> res_d(sims_ptr);
 
                 for (int p = 0; p < num_protos; p++){
-                    const int _p = p*c2_chn;
+                    // Load proto values into private memory
+                    [[intel::fpga_register]]
+                    float cur_proto[c2_chn];
+                    #pragma unroll
+                    for (int i = 0; i < c2_chn; i++){
+                        cur_proto[i] = proto_d[p*c2_chn + i];
+                    }
+
                     for (int y = 0; y < c2_dim; y++){
                         for (int x = 0; x < c2_dim; x++){
                             const int _y = y*c2_dim + x;
@@ -259,7 +266,7 @@ int main()
                             #pragma unroll 16
                             [[intel::ivdep]]
                             for (int c = 0; c < c2_chn; c++){
-                                float dist = in_d[c*c2_chn_size + _y] - proto_d[_p+c];
+                                float dist = in_d[c*c2_chn_size + _y] - cur_proto[c];
                                 res += dist*dist;
                             }
                             res = sycl::sqrt(res);
