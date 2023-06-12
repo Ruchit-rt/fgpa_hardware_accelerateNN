@@ -5,3 +5,8 @@ build
 .editorconfig
 .vscode/
 jobs
+*.cpu
+*.fpga_emu
+*.out
+*.a
+*.o

@@ -256,7 +256,7 @@ int main()
                         for (int x = 0; x < c2_dim; x++){
                             const int _y = y*c2_dim + x;
                             float res = 0.0f;
-                            #pragma unroll 2
+                            #pragma unroll 16
                             [[intel::ivdep]]
                             for (int c = 0; c < c2_chn; c++){
                                 float dist = in_d[c*c2_chn_size + _y] - proto_d[_p+c];
@@ -455,15 +455,15 @@ int main()
         print_exec_time(fc_event, "FC Event");
     }
 
-    // auto logits_to_host = q.submit([&] (handler &h) {
-    //     h.memcpy(logits.data(), logits_ptr, num_classes*sizeof(float));
-    // });
-    // logits_to_host.wait();
+    auto logits_to_host = q.submit([&] (handler &h) {
+        h.memcpy(logits.data(), logits_ptr, num_classes*sizeof(float));
+    });
+    logits_to_host.wait();
 
-    // auto upsample_to_host = q.submit([&] (handler &h) {
-    //     h.memcpy(upsample.data(), upsample_ptr, num_protos*img_dim*img_dim*sizeof(float));
-    // });
-    // logits_to_host.wait();
+    auto upsample_to_host = q.submit([&] (handler &h) {
+        h.memcpy(upsample.data(), upsample_ptr, num_protos*img_dim*img_dim*sizeof(float));
+    });
+    upsample_to_host.wait();
 
     free(img_f_ptr, q);
     free(img_ptr, q);
