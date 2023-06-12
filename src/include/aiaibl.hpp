@@ -209,18 +209,39 @@ void Conv (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale
         for (int y = 0; y < in_str_dim; y++){
             [[intel::ivdep]]
             for (int x = 0; x < in_str_dim; x++){
+                //offset for cur filter
+                [[intel::fpga_register]]
+                const int _fi = outc*in_chn*k_size;
+                
+                // Load filter into private memory
+                [[intel::fpga_register]]
+                int filter[in_chn*k_size];
+                #pragma unroll
+                for (int i = 0; i < in_chn*k_size; i++){
+                    filter[i] = filter_d[_fi + i];
+                }
+
+                [[intel::fpga_register]]
                 int32_t sum = 0;
                 #pragma unroll 2
+                [[intel::ivdep]]
                 for (int c = 0; c < in_chn; c++) {
-                    const int _fi = (outc * in_chn + c) * k_size;
+                
+                    [[intel::fpga_register]]
                     const int _c = c * in_dim * in_dim;
+
+                    // Load current channel into local memory
+                    int8_t inp_c[in_dim*in_dim];
+                    for (int i = 0; i < in_dim*in_dim;i++){
+                        inp_c[i] = input_d[_c+i];
+                    }
+                    [[intel::fpga_register]]
+                    const int _fi = in_chn * k_size;
                     #pragma unroll
                     for (int i = 0; i <= 2; i++) {
-                        const int _i = i * 3;
-                        const int _y = (y + i) * in_dim + x;
                         #pragma unroll
                         for (int j = 0; j <= 2; j++) {
-                            sum += filter_d[_fi + _i + j] * input_d[_c + _y + j];        
+                            sum += filter[_fi + i * 3 + j] * inp_c[_c + (y + i) * in_dim + j];        
                         }
                     }
                 }
