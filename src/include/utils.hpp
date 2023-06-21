@@ -72,4 +72,51 @@ void peek_int(int row, int col, int8_t *matrix, bool snapshot)
     cout << std::endl;
 }
 
+
+std::vector<int> findTopIndices(const  array) {
+    std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<std::pair<int, int>>> minHeap;
+
+    for (int i = 0; i < array.size(); i++) {
+        if (minHeap.size() < 9) {
+            minHeap.push(std::make_pair(array[i], i));
+        } else if (array[i] > minHeap.top().first) {
+            minHeap.pop();
+            minHeap.push(std::make_pair(array[i], i));
+        }
+    }
+
+    std::vector<int> topIndices;
+    while (!minHeap.empty()) {
+        topIndices.push_back(minHeap.top().second);
+        minHeap.pop();
+    }
+
+    return topIndices;
+}
+
+
+namespace {
+template <typename Func, std::size_t Index>
+    class SubmitOnePipeWrite {
+    public:
+    SubmitOnePipeWrite(Func &&f) {
+        f(std::integral_constant<std::size_t, Index>());
+    }
+};
+
+template <typename Func, std::size_t... Indices>
+inline constexpr void PipeWriteUnroller(Func &&f,
+                                        std::index_sequence<Indices...>) {
+(SubmitOnePipeWrite<Func, Indices>(f), ...); // fold expression
+}
+} //namespace
+
+template <std::size_t N,
+          typename Func>
+
+constexpr void SubmitPipeWrites(Func &&f) {
+  std::make_index_sequence<N> indices;
+  PipeWriteUnroller<>(f, indices);
+}
+
 #endif
