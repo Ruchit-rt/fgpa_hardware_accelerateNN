@@ -31,7 +31,7 @@ using namespace sycl;
 template <std::size_t ID> class Quant1ComputeUnits;
 template <std::size_t ID> class DequantComputeUnits;
 template <std::size_t ID> class Conv1FilterComputeNodes;
-template <std::size_t ID> class Conv2FilterComputeNodes;
+template <std::size_t ID,std::size_t PID> class Conv2FilterComputeNodes;
 template <std::size_t ID> class Conv1AccComputeNodes;
 template <std::size_t ID> class Conv2AccComputeNodes;
 template <std::size_t ID> class MaxPool1ComputeNodes;
@@ -17419,36 +17419,6 @@ void upsample4(queue &q, int chn, int row, int col, float *tensor_ptr, float* re
     free(tensor_ptr, q);
 }
 
-// Read int32 parameters from the given input stream.
-int32_t *read_param_int32(ifstream &rf)
-{
-    int len;
-    rf.read((char *)(&len), 4);
-    int32_t *result = new int32_t[len];
-    rf.read((char *)result, len * 4);
-    return result;
-}
-
-// Read int8 parameters from the given input stream.
-int8_t *read_param_int8(ifstream &rf)
-{
-    int len;
-    rf.read((char *)(&len), 4);
-    int8_t *result = new int8_t[len];
-    rf.read((char *)result, len);
-    return result;
-}
-
-// Read float (non-quantised) parameters from the given input stream.
-float *read_param_float(ifstream &rf)
-{
-    int len;
-    rf.read((char *)(&len), 4);
-    float *result = new float[len];
-    rf.read((char *)result, len * 4);
-    return result;
-}
-
 // Quantise the input TENSOR with the given SCALE.
 int8_t* quant(queue &q, int size, float scale, float *tensor_ptr)
 {
@@ -17606,46 +17576,6 @@ int main()
     std::vector<float> logits_f;
     std::vector<float> upsampled_f;
 
-    #if FPGA_EMULATOR
-    constexpr int img_dim = 56;
-    constexpr int c1_chn = 10;
-    constexpr int c2_chn = 20;
-    constexpr int num_protos = 5;
-    #else
-    constexpr int img_dim = 224;
-    constexpr int c1_chn = 64;
-    constexpr int c2_chn = 512;
-    constexpr int num_protos = 15;
-    #endif
-
-    constexpr int img_chn = 3;
-    constexpr int c1_dim = img_dim/2;
-    constexpr int c2_dim = img_dim/4;
-    constexpr int img_size = img_dim*img_dim;
-
-    constexpr double img_scale = 0.01979798823595047;
-    constexpr double filter_scale = 0.013484773226082325;
-    constexpr double result_scale = 0.04881289601325989;
-
-    constexpr int img_bursts = img_dim/2;
-    constexpr int conv1_bursts = img_dim;
-    constexpr int pool1_bursts = c1_dim/2;
-    constexpr int conv2_bursts = c1_dim;
-    constexpr int pool2_bursts = c2_dim;
-    constexpr int dequant_bursts = c2_dim;
-    
-    constexpr int img_burst_size = 2*img_dim;
-    constexpr int conv1_burst_size = img_dim;
-    constexpr int pool1_burst_size = 2*c1_dim;
-    constexpr int conv2_burst_size = c1_dim;
-    constexpr int pool2_burst_size = c2_dim;
-    constexpr int dequant_burst_size = c2_dim;
-
-    constexpr int filter_size = 9;
-    constexpr int num_classes = 3;
-
-    constexpr float scale = img_scale * filter_scale / result_scale;
-
     logits_f.resize(num_classes);
     upsampled_f.resize(num_protos*img_dim*img_dim);
 
@@ -17719,6 +17649,7 @@ int main()
 
     for (int i = 0; i < N; i++)
     {
+        float *input_f = load_image(i);
         auto start = high_resolution_clock::now();
 
         // Enqueue QUANTISATION kernals for each channel ################################################
@@ -17833,32 +17764,33 @@ int main()
         });
 
         // Enqueue CONVFILTER kernals for each channel ################################################
-        SubmitComputeUnits<c1_chn*c2_chn, Conv2FilterComputeNodes>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
-            device_ptr<int8_t> filter_d(conv2_f_ptr);
-            constexpr int in_chn = ID / c2_chn;
-            constexpr int out_chn = ID % c2_chn;
-            int8_t *filter = &filter_d[out_chn*c1_chn*filter_size + in_chn*filter_size];
-            
-            std::array<int8_t, pool1_burst_size> in_burst = Pool1Pipes::PipeAt<in_chn, out_chn>::read();
-            std::array<int32_t, conv2_burst_size> out_burst;
-
-            conv_top_row<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, filter, out_burst);
-            Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
-
-            std::array<int8_t, pool1_burst_size> last_burst = in_burst;
-            for (int i = 0; i < (c1_dim / 2) - 1; i++){
-                in_burst = Pool1Pipes::PipeAt<in_chn, out_chn>::read();
+        fpga_tools::UnrolledLoop<c1_chn>([&q, &conv2_f_ptr](auto in_chn){
+            SubmitComputeUnits_N<c2_chn, Conv2FilterComputeNodes, in_chn>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+                device_ptr<int8_t> filter_d(conv2_f_ptr);
+                constexpr int out_chn = ID;
+                int8_t *filter = &filter_d[out_chn*c1_chn*filter_size + in_chn*filter_size];
+                
+                std::array<int8_t, pool1_burst_size> in_burst = Pool1Pipes::PipeAt<in_chn, out_chn>::read();
                 std::array<int32_t, conv2_burst_size> out_burst;
 
-                conv_middle_rows<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, last_burst, filter, out_burst);
+                conv_top_row<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, filter, out_burst);
+                Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+
+                std::array<int8_t, pool1_burst_size> last_burst = in_burst;
+                for (int i = 0; i < (c1_dim / 2) - 1; i++){
+                    in_burst = Pool1Pipes::PipeAt<in_chn, out_chn>::read();
+                    std::array<int32_t, conv2_burst_size> out_burst;
+
+                    conv_middle_rows<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, last_burst, filter, out_burst);
+
+                    Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+                    last_burst = in_burst;
+                    
+                }
+                conv_bottom_row<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, filter, out_burst);
 
                 Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
-                last_burst = in_burst;
-                
-            }
-            conv_bottom_row<c1_dim, pool1_burst_size, conv2_burst_size>(in_burst, filter, out_burst);
-
-            Conv2FilterPipes::PipeAt<in_chn, out_chn>::write(out_burst);
+            });
         });
 
         // Enqueue CONVACC kernals for each channel ################################################
@@ -17918,32 +17850,182 @@ int main()
             }
         });
 
-        // float *pooled2_f_ptr = dequant(q, 512 * 56 * 56, 0.016132580116391182, pooled2_ptr);
+        // Enqueue Distance^2 kernals for each channel ################################################
+        fpga_tools::UnrolledLoop<c1_chn>([&q, &conv2_f_ptr](auto in_chn){
+        SubmitComputeUnits_N<c2_chn, Conv2FilterComputeNodes, in_chn>(q, [=] (auto ID) [[intel::kernel_args_restrict]]{
+        SubmitComputeUnits<c2_chn, DequantComputeUnits>(q, [=](auto ID) [[intel::kernel_args_restrict]]{
+            for (int burst_idx = 0; burst_idx < c2_dim; burst_idx++ ){
+                std::array<int8_t, pool2_burst_size> in_burst;
+                std::array<float, dequant_burst_size> out_burst;
+                
+                #pragma unroll
+                for (int k = 0; k < dequant_burst_size; k++){
+                    out_burst[k] = in_burst[burst_idx * pool2_burst_size + k] * img_scale;
+                }
+                fpga_tools::UnrolledLoop<num_protos>([&ID, out_burst](auto PID){
+                    DequantPipes::PipeAt<ID, PID>::write(out_burst);
+                });
+            }
+        });
 
-        // // Prototype layer.
-        // float *distances_f_ptr = l2_distance(q, 512, 56 * 56, pooled2_f_ptr, 15, prototypes);
-        // float *similarities_f_ptr = distance_2_similarity(q, 15 * 56 * 56, distances_f_ptr);
-        // float *avg_f_ptr = top9_average_pooling(q, 15, 56 * 56, similarities_f_ptr);
+        /*
+            Linear 2D Upsample by a scale factor 4 without alligning the corners 
+        */
+        auto upsample1_event = q.submit([&](handler &h) {
+            h.depends_on(similarity_event);
 
-        // // Compute upsampled activation map (information for interpretation).
-        // upsample4(q, 15, 56, 56, similarities_f_ptr, upsampled_f);
-        
+            h.single_task<class Upsample1>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(sims_ptr);
+                device_ptr<float> result_d(upsample_ptr);
+                for (int index = 0; index < num_protos; index++){
+                    // auto _q = (index[1] + 2) / 4;
+                    for (int i = 0; i < 2; i++) {
+                        [[intel::ivdep]]
+                        for (int j = 0; j < 2; j++){
+                            result_d[(index*c2_dim*c2_dim) + (i * c2_dim) + j] = tensor_d[index * c2_dim * c2_dim];
+                            result_d[(index * c2_dim * c2_dim) + (i * c2_dim) + 4 * c2_dim - 1 - j] = tensor_d[(index * c2_dim * c2_dim) + c2_dim - 1];
+                            result_d[(index * c2_dim * c2_dim) + (4 * c2_dim - 1 - i) * c2_dim + j] = tensor_d[(index * c2_dim * c2_dim) + (c2_dim - 1) * c2_dim];
+                            result_d[(index * c2_dim * c2_dim) + (4 * c2_dim - 1 - i) * c2_dim + 4 * c2_dim - 1 - j] = tensor_d[(index * c2_dim * c2_dim) + ((c2_dim - 1) * c2_dim) + c2_dim - 1];
+                        }
+                    }
+                }
+            });
 
-        // // Fully-connected layer.
-        // int8_t *avg_ptr = quant(q, 15, 0.01979798823595047, avg_f_ptr);
-        // int8_t *logits_ptr = fully_connected(q, 15, 3, avg_ptr, fc_weights);
-        // float *logits_f_ptr = dequant(q, 3, 0.06617073714733124, logits_ptr);
+        });
 
+        auto upsample2_event = q.submit([&](handler &h) {
+            h.depends_on(similarity_event);
 
-        // // Compute min_distance (information for interpretation).
-        // // bottom9_average_pooling(q, 15, 56 * 56, distances_f, avg_f);
+            h.single_task<class Upsample2>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(sims_ptr);
+                device_ptr<float> result_d(upsample_ptr);
+                for (int c = 0; c < num_protos; c++){
+                    for (int index = 0; index < (c2_dim * 4 - 4); index++){
+                        auto _r = 2* (index % 4) + 1;
+                        auto _q = index / 4;
+                        for (int i = 0; i < 2; i++){
+                            result_d[(c * c2_dim * c2_dim) + (i * c2_dim) + index + 2] = (tensor_d[(c * c2_dim * c2_dim) + _q] * (8 - _r) + tensor_d[(c * c2_dim * c2_dim) + _q + 1] * _r) / 8;
+                            result_d[(c * c2_dim * c2_dim) + (4 * c2_dim - 1 - i) * c2_dim + index + 2] = (tensor_d[(c * c2_dim * c2_dim) + (c2_dim - 1) * c2_dim + _q] * (8 - _r) + tensor_d[(c * c2_dim * c2_dim) + (c2_dim - 1) * c2_dim + _q + 1] * _r) / 8;
+                        }     
+                    }
+                }
+                
+            });
+        });
 
+        auto upsample3_event = q.submit([&](handler &h) {
+            h.single_task<class Upsample3>([=] () [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(sims_ptr);
+                device_ptr<float> result_d(upsample_ptr);
+                for (int c = 0; c < num_protos; c++){
+                    for (int index = 0; index < (c2_dim * 4 - 4); index++){
+                        auto _r = 2 * (c % 4) + 1;
+                        auto _q = c / 4;
+                        for (int i = 0; i < 2; i++) {
+                            result_d[(index * c2_dim * c2_dim) + (c + 2) * c2_dim + i] = (tensor_d[(index * c2_dim * c2_dim) + _q * c2_dim] * (8 - _r) + tensor_d[(index * c2_dim * c2_dim) + (_q + 1) * c2_dim] * _r) / 8;
+                            result_d[(index * c2_dim * c2_dim) + (c + 2) * c2_dim + 4 * c2_dim - 1 - i] = (tensor_d[(index * c2_dim * c2_dim) + _q * c2_dim + c2_dim - 1] * (8 - _r) + tensor_d[(index * c2_dim * c2_dim) + (_q + 1) * c2_dim + c2_dim - 1] * _r) / 8;
+                        }
+                    }
+                }
+            });
+        });
 
-        // q.wait();
-        // auto logits_to_host = q.submit([&] (handler &h) {
-        //     h.memcpy(&logits_f[0], logits_f_ptr, 3 * sizeof(float));
-        // });
-        // logits_to_host.wait();
+        auto upsample4_event = q.submit([&](handler &h) {
+            h.single_task<class Upsample4>([=] () [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(sims_ptr);
+                device_ptr<float> result_d(upsample_ptr);
+                for (int c = 0; c < num_protos; c++){
+                    for (int y = 0; y < c2_dim * 4 - 4; y++){
+                        for (int x = 0; x < c2_dim * 4 - 4; x++){
+                            auto _r1 = 2 * (y % 4) + 1;
+                            auto _q1 = y / 4;
+                            auto _r2 = 2 * (x % 4) + 1;
+                            auto _q2 = x / 4;
+                            result_d[(c * c2_dim * c2_dim) + (y + 2) * c2_dim + x + 2]
+                                = (tensor_d[(c * c2_dim * c2_dim) + _q1 * c2_dim +_q2] * (8 - _r1) + tensor_d[(c * c2_dim * c2_dim) + (_q1 + 1) * c2_dim + _q2] * _r1) * (8 - _r2) / 64
+                                + (tensor_d[(c * c2_dim * c2_dim) + _q1 * c2_dim + _q2 + 1] * (8 - _r1) + tensor_d[(c * c2_dim * c2_dim) + (_q1 + 1) * c2_dim + _q2 + 1] * _r1) * _r2 / 64;
+                        }
+                    }
+                }
+            });
+        });
+
+        /*
+            Calculate similarity score between feature map and prototypes using top-9 averaging
+        */
+        auto sim_score_event = q.submit([&](handler &h) {
+            h.depends_on(similarity_event);
+
+            h.single_task<class SimScore>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> in_d(sims_ptr);
+                device_ptr<int8_t> result_d(sim_score_ptr);
+
+                for (int c = 0; c < num_protos; c++){
+                    float r_[9];
+                    for (int i = 0; i < 9; i++) {
+                        r_[i] = in_d[c * c2_dim*c2_dim + i];
+                        int k = i;
+                        while (true) {
+                            if ((r_[k] >= r_[k / 2]) ) break;
+                            float temp = r_[k];
+                            r_[k] = r_[k / 2];
+                            r_[k / 2] = temp;
+                            k /= 2;
+                        }
+                    }
+                
+                    for (int i = 9; i < c2_dim*c2_dim; i++) {
+                        if (in_d[c * c2_dim*c2_dim + i] > r_[0]) {
+                            r_[0] = in_d[c * c2_dim*c2_dim + i];
+                            int k = 0;
+                            while (k < 9) {
+                                if (k >= 4) break;
+
+                                if (r_[k] > r_[2 * k + 1] || r_[k] > r_[2 * k + 2]) {
+                                    float temp = r_[k];
+                                    if (r_[2 * k + 1] < r_[2 * k + 2]) {
+                                        r_[k] = r_[2 * k + 1];
+                                        r_[2 * k + 1] = temp;
+                                        k = 2 * k + 1;
+                                    } else {
+                                        r_[k] = r_[2 * k + 2];
+                                        r_[2 * k + 2] = temp;
+                                        k = 2 * k + 2;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    float res = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+                    result_d[c] = round(res / 0.01979798823595047);
+                }
+            });
+        });
+
+        /*
+            Fully Connected layer between prototypes and classification score
+        */
+        auto fc_event = q.submit([&](handler &h) {
+            h.depends_on(sim_score_event);
+            h.depends_on(weights_to_device_event);
+
+            h.single_task<class FC>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<int8_t> in_d(sim_score_ptr);
+                device_ptr<int8_t> w_d(weights_ptr);
+                device_ptr<float> result_d(logits_ptr);
+
+                for (int index = 0; index < num_classes; index++){
+                    // The scales are hardcoded for the sole fully-connected layer of our model.
+                    int32_t sum = 0;
+                    for (int i = 0; i < num_protos; i++) {
+                        sum += in_d[i] * w_d[index * num_protos + i];
+                    }
+                    result_d[index] = round(sum * 0.01979798823595047*0.009601877070963383);
+                }
+            });
+        });
 
         auto stop = high_resolution_clock::now();
         times[i] = duration_cast<microseconds>(stop - start).count();

@@ -17,12 +17,9 @@ using namespace sycl;
 // Number of iterations.
 #define N 1
 
-template <std::size_t ID> class Conv1ID;
-template <std::size_t ID> class Conv2ID;
-
 // The test input, a flattened and normalised 3 * 448 * 448 image. It is a picture of a carrot.
 float input_f[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.5451, 0.5569,
-                   0.5490, 0.5765, 0.5922, 0.5725, 0.5686, 0.5686, 0.5451, 0.5451, 0.5333,
+                0.5490, 0.5765, 0.5922, 0.5725, 0.5686, 0.5686, 0.5451, 0.5451, 0.5333,
                    0.5216, 0.5098, 0.5020, 0.5059, 0.5294, 0.5529, 0.5569, 0.5490, 0.5412,
                    0.5333, 0.5373, 0.5451, 0.5412, 0.5373, 0.5333, 0.5255, 0.5137, 0.5059,
                    0.5059, 0.5059, 0.5059, 0.5020, 0.4784, 0.4510, 0.4588, 0.4510, 0.4157,
@@ -16813,591 +16810,6 @@ void peek_int(int row, int col, int8_t *matrix, bool snapshot)
     cout << std::endl;
 }
 
-/* Carry out MaxPool on the given TENSOR (C * H * W) with a stride of 2. */
-int8_t* max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor_ptr)
-{
-    const int stride = 2;
-    const int nr = 1 + (row - 1) / stride;
-    const int nc = 1 + (col - 1) / stride;
-
-    int8_t* result_ptr = (int8_t*) malloc_device(chn * nr * nc * sizeof(int8_t), q);
-
-    auto pool_event = q.submit([&](handler &h) {
-    
-        h.single_task<class MaxpoolID>([=]() [[intel::kernel_args_restrict]]{
-            device_ptr<int8_t> tensor_d(tensor_ptr);
-            device_ptr<int8_t> result_d(result_ptr);
-
-            for (int i = 0; i < chn * nr * nc; i++){
-                int index[3] = {i / (nr * nc), (i / nc) % nr, i % nc};
-                int max_r = (index[1] + 1) * stride;
-                int max_c = (index[2] + 1) * stride;
-                int8_t f = numeric_limits<int8_t>::lowest();
-                for (int i = index[1] * stride; i < max_r; i++) {
-                    for (int j = index[2] * stride; j < max_c; j++) {
-                        int8_t cur = tensor_d[index[0] * row * col + i * col + j];
-                        f = f > cur ? f : cur;
-                    }
-                }
-                result_d[index[0] * nr * nc + index[1] * nc + index[2]] = f;
-            }
-        });
-    });
-    pool_event.wait();
-    print_exec_time(pool_event, "Pool");
-    free(tensor_ptr, q);
-
-    return result_ptr;
-}
-
-// Quantise the input TENSOR with the given SCALE.
-int8_t* quant(queue &q, int size, float scale, float *tensor_ptr)
-{
-    int8_t* result_ptr = (int8_t*) malloc_device(size * sizeof(int8_t), q);
-
-    auto quant_event = q.submit([&](handler &h) {
-        h.single_task<class QuantID>([=]() [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<int8_t> result_d(result_ptr);
-
-            for (int i = 0; i < size; i++){
-                result_d[i] = round(tensor_d[i] / scale);
-            }
-        });
-     });
-
-     quant_event.wait();
-     print_exec_time(quant_event, "Quant");
-     free(tensor_ptr, q);
-
-     return result_ptr;
-}
-
-// Dequantise the input TENSOR with the given SCALE.
-float* dequant(queue &q, int size, float scale, int8_t *tensor_ptr)
-{
-    float* result_ptr = (float*) malloc_device(size * sizeof(float), q);
-
-    auto dequant_event = q.submit([&](handler &h) {
-        h.single_task<class DequantID>([=]() [[intel::kernel_args_restrict]]{
-            device_ptr<int8_t> tensor_d(tensor_ptr);
-            device_ptr<float> result_d(result_ptr);
-            
-            for (int i = 0; i < size; i++){
-                result_d[i] = tensor_d[i] * scale;
-            }
-        });
-    });
-    dequant_event.wait();
-    print_exec_time(dequant_event, "Dequant");
-    free(tensor_ptr, q);
-
-    return result_ptr;
-}
-template <template <std::size_t ID> typename Name, int chn, int size, int d>
-/* Carry out quantised convolution (with padding) between the TENSOR (1 * CHN * W * W) and the FILTER (D * CHN * 3 * 3), then ReLU. */
-int8_t* conv_pad_q(queue &q, int8_t *tensor_ptr, int8_t *filter, int32_t *biases, float tensor_scale, float filter_scale, float result_scale)
-{
-    int8_t* filter_ptr = (int8_t*) malloc_device(d * chn * 9 * sizeof(int8_t), q);
-    int32_t* bias_ptr = (int32_t*) malloc_device(d * sizeof(int32_t), q);
-    int8_t* result_ptr = (int8_t*) malloc_device(d * size * size * sizeof(int8_t), q);
-
-    auto filter_to_device_event = q.memcpy(filter_ptr, &filter[0], d * chn * 9 * sizeof(int8_t));
-    auto bias_to_device_event = q.memcpy(bias_ptr, &biases[0], d * sizeof(int32_t));
-
-    auto corner_event = q.submit([&](handler &h)
-    {
-        h.depends_on(filter_to_device_event);
-        h.depends_on(bias_to_device_event);
-        
-        h.single_task<Name<0>>([=]() [[intel::kernel_args_restrict]]{
-            device_ptr<int8_t> tensor_d(tensor_ptr);
-            device_ptr<int8_t> filter_d(filter_ptr);
-            device_ptr<int32_t> bias_d(bias_ptr);
-            device_ptr<int8_t> result_d(result_ptr);
-
-            for (int index = 0; index < d; index++){
-                int32_t sum = 0;
-                const float scale = tensor_scale * filter_scale / result_scale;
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index * chn + c;
-                    sum += filter_d[_fi * 9 + 4] * tensor_d[c * size * size];
-                    sum += filter_d[_fi * 9 + 5] * tensor_d[c * size * size + 1];
-                    sum += filter_d[_fi * 9 + 7] * tensor_d[c * size * size + size];
-                    sum += filter_d[_fi * 9 + 8] * tensor_d[c * size * size + size + 1];
-                }
-
-                sum += bias_d[index];
-                result_d[index * size * size] = sum > 0 ? round(sum * scale) : 0;
-
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index * chn + c;
-                    sum += filter_d[_fi * 9 + 3] * tensor_d[c * size * size + size - 2];
-                    sum += filter_d[_fi * 9 + 4] * tensor_d[c * size * size + size - 1];
-                    sum += filter_d[_fi * 9 + 6] * tensor_d[c * size * size + size + size - 2];
-                    sum += filter_d[_fi * 9 + 7] * tensor_d[c * size * size + size + size - 1];
-                }
-
-                sum += bias_d[index];
-                result_d[index * size *size + size - 1] = sum > 0 ? round(sum * scale) : 0;
-
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index * chn + c;
-                    sum += filter_d[_fi * 9 + 1] * tensor_d[c * size * size + (size - 2) * size];        
-                    sum += filter_d[_fi * 9 + 2] * tensor_d[c * size * size + (size - 2) * size + 1];        
-                    sum += filter_d[_fi * 9 + 4] * tensor_d[c * size * size + (size - 1) * size];        
-                    sum += filter_d[_fi * 9 + 5] * tensor_d[c * size * size + (size - 1) * size + 1];        
-                }
-
-                sum += bias_d[index];
-                result_d[index * size * size + (size - 1) * size] = sum > 0 ? round(sum * scale) : 0;
-                
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index * chn + c;
-                    sum += filter_d[_fi * 9] * tensor_d[c * size * size + (size - 2) * size + size - 2];
-                    sum += filter_d[_fi * 9 + 1] * tensor_d[c * size * size + (size - 2) * size + size - 1];
-                    sum += filter_d[_fi * 9 + 3] * tensor_d[c * size * size + (size - 1) * size + size - 2];
-                    sum += filter_d[_fi * 9 + 4] * tensor_d[c * size * size + (size - 1) * size + size - 1];
-                }
-
-                sum += bias_d[index];
-                result_d[index * size * size + (size - 1) * size + size - 1] = sum > 0 ? round(sum * scale) : 0;
-            }
-        });
-    });
-
-    // Task for the boundary elements.
-    auto boundry_event = q.submit([&](handler &h) {
-        h.depends_on(filter_to_device_event);
-        h.depends_on(bias_to_device_event);
-
-        h.single_task<Name<1>>([=]() {
-            device_ptr<int8_t> tensor_d(tensor_ptr);
-            device_ptr<int8_t> filter_d(filter_ptr);
-            device_ptr<int32_t> bias_d(bias_ptr);
-            device_ptr<int8_t> result_d(result_ptr);
-
-            const float scale = tensor_scale * filter_scale / result_scale;
-            for (int i = 0; i < d * (size - 2); i++) {
-                int index[2] = { i / (size - 2), i % (size - 2) };
-                int32_t sum1 = 0;
-                #pragma unroll
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index[0] * chn + c;
-                    #pragma unroll
-                    for (int i = 0; i <= 1; i++) {
-                        #pragma unroll
-                        for (int j = 0; j <= 2; j++) {
-                            sum1 += filter_d[_fi * 9 + (i+1) * 3 + j] * tensor_d[c * size * size + (i * size) + index[1] + j];
-                        }
-                    }
-                }
-
-                sum1 += bias_d[index[0]];
-                result_d[index[0] * size * size + index[1] + 1] = sum1 > 0 ? round(sum1 * scale) : 0;
-
-                int32_t sum2 = 0;
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index[0] * chn + c;
-                    #pragma unroll
-                    for (int i = -2; i <= -1; i++) {
-                        #pragma unroll
-                        for (int j = 0; j <= 2; j++) {
-                            sum2 += filter_d[_fi * 9 + (i + 2) * 3 + j] * tensor_d[c * size * size + (size + i) * size + index[1] + j];      
-                        }
-                    }
-                }
-
-                sum2 += bias_d[index[0]];
-                result_d[index[0] * size * size + (size - 1) * size + index[1] + 1] = sum2 > 0 ? round(sum2 * scale) : 0;
-
-                int32_t sum3 = 0;
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index[0] * chn + c;
-                    #pragma unroll
-                    for (int i = 0; i <= 2; i++) {
-                        #pragma unroll
-                        for (int j = 0; j <= 1; j++) {
-                            sum3 += filter_d[_fi * 9 + i * 3 + j + 1] * tensor_d[c * size * size + (index[1] + i) * size + j];        
-                        }
-                    }
-                }
-
-                sum3 += bias_d[index[0]];
-                result_d[index[0] * size * size + (index[1] + 1) * size] = sum3 > 0 ? round(sum3 * scale) : 0;
-
-                int32_t sum4 = 0;
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index[0] * chn + c;
-                    #pragma unroll
-                    for (int i = 0; i <= 2; i++) {
-                        #pragma unroll
-                        for (int j = -2; j <= -1; j++) {
-                        sum4 += filter_d[_fi * 9 + i * 3 + j + 2] * tensor_d[c * size * size + (index[1] + i) * size + size + j];        
-                        }
-                    }
-                }
-
-                sum4 += bias_d[index[0]];
-                result_d[index[0] * size * size + (index[1] + 1) * size + size - 1] = sum4 > 0 ? round(sum4 * scale) : 0;
-            }
-        });
-    });
-
-    // Task for interior elements (that uses all 3 * 3 filters).
-    auto interior_event = q.submit([&](handler &h) {
-        h.depends_on(filter_to_device_event);
-        h.depends_on(bias_to_device_event);
-
-        h.single_task<Name<2>>([=]() {
-            device_ptr<int8_t> tensor_d(tensor_ptr);
-            device_ptr<int8_t> filter_d(filter_ptr);
-            device_ptr<int32_t> bias_d(bias_ptr);
-            device_ptr<int8_t> result_d(result_ptr);
-
-            const float scale = tensor_scale * filter_scale / result_scale;
-            for (int i = 0; i < (size - 2) * (size - 2); i++){
-                int index[3] = { i / ((size - 2) * (size - 2)), (i / (size -2)) % (size - 2), i % (size - 2) };
-                int32_t sum = 0;
-                #pragma unroll 2 // Partial unrolling for the outermost loop.
-                for (int c = 0; c < chn; c++) {
-                    int _fi = index[0] * chn + c;
-                    for (int i = 0; i <= 2; i++) {
-                        for (int j = 0; j <= 2; j++) {
-                            sum += filter_d[index[0] * chn + c * 9 + i * 3 + j] * inp_d[c * size * size + (index[1] + i) * size + index[2] + j];        
-                        }
-                    }
-                }
-
-                sum += bias_d[index[0]];
-                result_d[index[0] * size * size + (index[1] + 1) * size + index[2] + 1] = sum > 0 ? round(sum * scale) : 0;
-            }
-        });
-    });
-
-    corner_event.wait();
-    boundry_event.wait();
-    interior_event.wait();
-
-    print_exec_time(corner_event, "Corner conv");
-    print_exec_time(boundry_event, "Boundry conv");
-    print_exec_time(interior_event, "Interior conv");
-
-    free(tensor_ptr, q);
-    free(filter_ptr, q);
-    free(bias_ptr, q);
-
-    return result_ptr;
-}
-
-/* Carry out the calculation for a fully-connected layer. */
-int8_t* fully_connected(queue &q, int c_in, int c_out, int8_t *tensor_ptr,
-                     int8_t *weights)
-{
-    int8_t* weights_ptr = (int8_t*) malloc_device(c_out * c_in * sizeof(int8_t), q);
-    int8_t* result_ptr = (int8_t*) malloc_device(c_out * sizeof(int8_t), q);
-
-    auto weights_to_device_event = q.memcpy(weights_ptr, &weights[0], c_out * c_in * sizeof(int8_t));
-
-    auto fc_event = q.submit([&](handler &h) {
-        h.depends_on(weights_to_device_event);
-
-        h.single_task<class FC>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<int8_t> tensor_d(tensor_ptr);
-            device_ptr<int8_t> weights_d(weights_ptr);
-            device_ptr<int8_t> result_d(result_ptr);
-
-            for (int index = 0; index < c_out; index++){
-                // The scales are hardcoded for the sole fully-connected layer of our model.
-                const float tensor_scale = 0.01979798823595047;
-                const float filter_scale = 0.009601877070963383;
-                const float result_scale = 0.06617073714733123779;
-                const float scale = tensor_scale * filter_scale / result_scale;
-                int32_t sum = 0;
-                for (int i = 0; i < c_in; i++) {
-                    sum += tensor_d[i] * weights_d[index * c_in + i];
-                }
-                result_d[index] = round(sum * scale);
-            }
-        });
-    });
-
-    fc_event.wait();
-    print_exec_time(fc_event, "FC");
-
-    free(weights_ptr, q);
-    free(tensor_ptr, q);
-
-    return result_ptr;
-}
-
-/* The L2-distance computation, used for the prototype layer. */
-float* l2_distance(queue &q, int chn, int length, float *tensor_ptr, int p_len, float *prototypes)
-{
-    float* result_ptr = (float*) malloc_device(p_len * length * sizeof(float), q);
-    float* proto_ptr = (float*) malloc_device(p_len * chn * sizeof(float), q);
-
-    auto dist_event = q.submit([&](handler &h) {
-        h.single_task<class L2Dist>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<float> proto_d(proto_ptr);
-            device_ptr<float> result_d(result_ptr);
-
-            for (int proto_idx = 0; proto_idx < p_len; proto_idx++){
-                for (int feat_idx = 0; feat_idx < length; feat_idx++){
-                    float sum = 0.0f;
-                    int p = proto_idx * chn;
-                    #pragma clang contract(fast)
-                    for (int c = 0; c < chn; c++) {
-
-                        float dist = inp_d[c * length + feat_idx] - proto_d[p + c];
-                        sum += dist*dist;
-                    }
-                    result_d[proto_idx * length + feat_idx] = sycl::sqrt(sum);
-                }
-            }
-        });
-    });
-
-    dist_event.wait();
-    print_exec_time(dist_event, "Distance");
-    free(tensor_ptr, q);
-    free(proto_ptr, q);
-
-    return result_ptr;
-}
-
-/* Convert distances to similarity map (part of the prototype layer). */
-float* distance_2_similarity(queue &q, int length, float *tensor_ptr)
-{
-    float* result_ptr = (float*) malloc_device(length * sizeof(float), q);
-    auto sim_event = q.submit([&](handler &h) {
-        h.single_task<class Dist2Sim>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<float> result_d(result_ptr);
-
-            for (int index = 0; index < length; index++){
-                result_d[index] = log((tensor_d[index] + 1) / (tensor_d[index] + 0.0001f));
-            }
-        });
-    });
-    sim_event.wait();
-    print_exec_time(sim_event, "Dist 2 Sim");
-    free(tensor_ptr, q);
-
-    return result_ptr;
-}
-
-/* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
-float* top9_average_pooling(queue &q, int chn, int length, float *tensor_ptr)
-{
-    float* result_ptr = (float*) malloc_device(chn * sizeof(float), q);
-    auto top9_event = q.submit([&](handler &h) {
-    // The implementation uses a max-heap to keep track of the 9 largest elements.
-        h.single_task<class Top9>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<float> result_d(result_ptr);
-
-            for (int index = 0; index < chn; index++){
-                float r_[9];
-                for (int i = 0; i < 9; i++) {
-                    r_[i] = tensor_d[index * length + i];
-                    int k = i;
-                    while (true) {
-                        if ((r_[k] >= r_[k / 2]) ) break;
-                        float temp = r_[k];
-                        r_[k] = r_[k / 2];
-                        r_[k / 2] = temp;
-                        k /= 2;
-                    }
-                }
-
-                for (int i = 9; i < length; i++) {
-                    if (tensor_d[index * length + i] > r_[0]) {
-                        r_[0] = tensor_d[index * length + i];
-                        int k = 0;
-                        while (k < 9) {
-                            if (k >= 4) break;
-
-                            if (r_[k] > r_[2 * k + 1] || r_[k] > r_[2 * k + 2]) {
-                                float temp = r_[k];
-                                if (r_[2 * k + 1] < r_[2 * k + 2]) {
-                                    r_[k] = r_[2 * k + 1];
-                                    r_[2 * k + 1] = temp;
-                                    k = 2 * k + 1;
-                                } else {
-                                    r_[k] = r_[2 * k + 2];
-                                    r_[2 * k + 2] = temp;
-                                    k = 2 * k + 2;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                result_d[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
-            }
-        });
-    });
-    top9_event.wait();
-    print_exec_time(top9_event, "Top 9");
-
-    return result_ptr;
-}
-
-/* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
-void bottom9_average_pooling(queue &q, int chn, int length, float *tensor, float *result)
-{
-    {
-        buffer m_buf(tensor, range(chn, length));
-        buffer r_buf(result, range(chn));
-        q.submit([&](handler &h)
-                 {
-      accessor m(m_buf, h, read_only);
-      accessor r(r_buf, h);
-
-      // The implementation uses a max-heap to keep track of the 9 largest elements.
-      h.single_task<class Bottom9>([=] () {
-        for (int index = 0; index < chn; index++){
-            float r_[9];
-            for (int i = 0; i < 9; i++) {
-            r_[i] = m[index][i];
-            int k = i;
-            while (true) {
-                if (r_[k] <= r_[k / 2]) break;
-                float temp = r_[k];
-                r_[k] = r_[k / 2];
-                r_[k / 2] = temp;
-                k /= 2;
-            }
-            }
-
-            for (int i = 9; i < length; i++) {
-            if (m[index][i] <= r_[0]) {
-                r_[0] = m[index][i];
-                int k = 0;
-                while (k < 9) {
-                if (k >= 4) break;
-
-                if (r_[k] <= r_[2 * k + 1] || r_[k] <= r_[2 * k + 2]) {
-                    float temp = r_[k];
-                    if (r_[2 * k + 1] >= r_[2 * k + 2]) {
-                    r_[k] = r_[2 * k + 1];
-                    r_[2 * k + 1] = temp;
-                    k = 2 * k + 1;
-                    } else {
-                    r_[k] = r_[2 * k + 2];
-                    r_[2 * k + 2] = temp;
-                    k = 2 * k + 2;
-                    }
-                } else {
-                    break;
-                }
-                }
-            }
-            }
-
-            r[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
-        }
-      });
-    });
-    }
-}
-
-/* Upsample the TENSOR by a factor of 2 using Linear 2D without aligning the corners. */
-void upsample4(queue &q, int chn, int row, int col, float *tensor_ptr, float* result)
-{
-    float* result_ptr = (float*) malloc_device(chn * row * col * sizeof(float) * 16, q);
-
-    auto upsample1_event = q.submit([&](handler &h) {
-        h.single_task<class Upsample1>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<float> result_d(result_ptr);
-            for (int index = 0; index < chn; index++){
-                // auto _q = (index[1] + 2) / 4;
-                for (int i = 0; i < 2; i++) {
-                    for (int j = 0; j < 2; j++){
-                        result_d[(index * row * col) + (i * col) + j] = tensor_d[index * row * col];
-                        result_d[(index * row * col) + (i * col) + 4 * col - 1 - j] = tensor_d[(index * row * col) + col - 1];
-                        result_d[(index * row * col) + (4 * row - 1 - i) * col + j] = tensor_d[(index * row * col) + (row - 1) * col];
-                        result_d[(index * row * col) + (4 * row - 1 - i) * col + 4 * col - 1 - j] = tensor_d[(index * row * col) + ((row - 1) * col) + col - 1];
-                    }
-                }
-            }
-        });
-    });
-
-    auto upsample2_event = q.submit([&](handler &h) {
-        h.single_task<class Upsample2>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<float> result_d(result_ptr);
-            for (int i = 0; i < chn * (col * 4 - 4); i++){
-                int index[2] = {i / (col * 4 -4), i % (col * 4 -4)};
-                auto _r = 2 * (index[1] % 4) + 1;
-                auto _q = index[1] / 4;
-                for (int i = 0; i < 2; i++) {
-                result_d[(index[0] * row * col) + (i * col) + index[1] + 2] = (tensor_d[(index[0] * row * col) + _q] * (8 - _r) + tensor_d[(index[0] * row * col) + _q + 1] * _r) / 8;
-                result_d[(index[0] * row * col) + (4 * row - 1 - i) * col + index[1] + 2] = (tensor_d[(index[0] * row * col) + (row - 1) * col + _q] * (8 - _r) + tensor_d[(index[0] * row * col) + (row - 1) * col + _q + 1] * _r) / 8;
-                }
-            }
-        });
-    });
-
-    auto upsample3_event = q.submit([&](handler &h) {
-        h.single_task<class Upsample3>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<float> result_d(result_ptr);
-            for (int i = 0; i < chn * (row * 4 - 4); i++){
-                int index[2] = {i / (row * 4 -4), i % (row * 4 -4)};
-                auto _r = 2 * (index[1] % 4) + 1;
-                auto _q = index[1] / 4;
-                for (int i = 0; i < 2; i++) {
-                    result_d[(index[0] * row * col) + (index[1] + 2) * col + i] = (tensor_d[(index[0] * row * col) + _q * col] * (8 - _r) + tensor_d[(index[0] * row * col) + (_q + 1) * col] * _r) / 8;
-                    result_d[(index[0] * row * col) + (index[1] + 2) * col + 4 * col - 1 - i] = (tensor_d[(index[0] * row * col) + _q * col + col - 1] * (8 - _r) + tensor_d[(index[0] * row * col) + (_q + 1) * col + col - 1] * _r) / 8;
-                }
-            }
-        });
-    });
-
-    auto upsample4_event = q.submit([&](handler &h) {
-        h.single_task<class Upsample4>([=] () [[intel::kernel_args_restrict]]{
-            device_ptr<float> tensor_d(tensor_ptr);
-            device_ptr<float> result_d(result_ptr);
-            for (int i = 0; i < chn * (row * 4 - 4) * (col * 4 - 4); i++){
-                int index[3] = {i / ((row * 4 - 4) * (col * 4 - 4)), (i / (col * 4 - 4)) % (row * 4 - 4), i % (col * 4 - 4)};
-                auto _r1 = 2 * (index[1] % 4) + 1;
-                auto _q1 = index[1] / 4;
-                auto _r2 = 2 * (index[2] % 4) + 1;
-                auto _q2 = index[2] / 4;
-                result_d[(index[0] * row * col) + (index[1] + 2) * col + index[2] + 2]
-                    = (tensor_d[(index[0] * row * col) + _q1 * col +_q2] * (8 - _r1) + tensor_d[(index[0] * row * col) + (_q1 + 1) * col + _q2] * _r1) * (8 - _r2) / 64
-                    + (tensor_d[(index[0] * row * col) + _q1 * col + _q2 + 1] * (8 - _r1) + tensor_d[(index[0] * row * col) + (_q1 + 1) * col + _q2 + 1] * _r1) * _r2 / 64;
-            }
-        });
-    });
-
-    // write back after all computation
-    auto device_to_host = q.submit([&] (handler &h) {
-        h.depends_on(upsample1_event);
-        h.depends_on(upsample2_event);
-        h.depends_on(upsample3_event);
-        h.depends_on(upsample4_event);
-        
-        h.memcpy(&result[0], result_ptr, chn * row * col * sizeof(float) * 16);
-    });
-    device_to_host.wait();
-    print_exec_time(upsample1_event, "Upsample 1");
-    print_exec_time(upsample2_event, "Upsample 2");
-    print_exec_time(upsample3_event, "Upsample 3");
-    print_exec_time(upsample4_event, "Upsample 4");
-    free(tensor_ptr, q);
-}
-
 // Read int32 parameters from the given input stream.
 int32_t *read_param_int32(ifstream &rf)
 {
@@ -17428,19 +16840,198 @@ float *read_param_float(ifstream &rf)
     return result;
 }
 
+template <int in_chn,
+          int in_dim,
+          int out_chn,
+          int k_size
+          >
+void ConvCorners (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale, int8_t* result_ptr) {
+    device_ptr<int8_t> input_d(input_ptr);
+    device_ptr<int8_t> filter_d(filter_ptr);
+    device_ptr<int32_t> bias_d(bias_ptr);
+    device_ptr<int8_t> result_d(result_ptr);
+
+    for (int index = 0; index < out_chn; index++){
+        int32_t sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index * in_chn + c;
+            sum += filter_d[_fi * k_size + 4] * input_d[c * in_dim * in_dim];
+            sum += filter_d[_fi * k_size + 5] * input_d[c * in_dim * in_dim + 1];
+            sum += filter_d[_fi * k_size + 7] * input_d[c * in_dim * in_dim + in_dim];
+            sum += filter_d[_fi * k_size + 8] * input_d[c * in_dim * in_dim + in_dim + 1];
+        }
+
+        sum += bias_d[index];
+        result_d[index * in_dim * in_dim] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index * in_chn + c;
+            sum += filter_d[_fi * 9 + 3] * input_d[c * in_dim * in_dim + in_dim - 2];
+            sum += filter_d[_fi * 9 + 4] * input_d[c * in_dim * in_dim + in_dim - 1];
+            sum += filter_d[_fi * 9 + 6] * input_d[c * in_dim * in_dim + in_dim + in_dim - 2];
+            sum += filter_d[_fi * 9 + 7] * input_d[c * in_dim * in_dim + in_dim + in_dim - 1];
+        }
+
+        sum += bias_d[index];
+        result_d[index * in_dim *in_dim + in_dim - 1] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index * in_chn + c;
+            sum += filter_d[_fi * 9 + 1] * input_d[c * in_dim * in_dim + (in_dim - 2) * in_dim];        
+            sum += filter_d[_fi * 9 + 2] * input_d[c * in_dim * in_dim + (in_dim - 2) * in_dim + 1];        
+            sum += filter_d[_fi * 9 + 4] * input_d[c * in_dim * in_dim + (in_dim - 1) * in_dim];        
+            sum += filter_d[_fi * 9 + 5] * input_d[c * in_dim * in_dim + (in_dim - 1) * in_dim + 1];        
+        }
+
+        sum += bias_d[index];
+        result_d[index * in_dim * in_dim + (in_dim - 1) * in_dim] = sum > 0 ? round(sum * scale) : 0;
+        
+        sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index * in_chn + c;
+            sum += filter_d[_fi * 9] * input_d[c * in_dim * in_dim + (in_dim - 2) * in_dim + in_dim - 2];
+            sum += filter_d[_fi * 9 + 1] * input_d[c * in_dim * in_dim + (in_dim - 2) * in_dim + in_dim - 1];
+            sum += filter_d[_fi * 9 + 3] * input_d[c * in_dim * in_dim + (in_dim - 1) * in_dim + in_dim - 2];
+            sum += filter_d[_fi * 9 + 4] * input_d[c * in_dim * in_dim + (in_dim - 1) * in_dim + in_dim - 1];
+        }
+
+        sum += bias_d[index];
+        result_d[index * in_dim * in_dim + (in_dim - 1) * in_dim + in_dim - 1] = sum > 0 ? round(sum * scale) : 0;
+    }
+}
+template <int in_chn,
+          int in_dim,
+          int out_chn,
+          int k_size
+          >
+void ConvBoundry (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale, int8_t* result_ptr)
+{
+    device_ptr<int8_t> input_d(input_ptr);
+    device_ptr<int8_t> filter_d(filter_ptr);
+    device_ptr<int32_t> bias_d(bias_ptr);
+    device_ptr<int8_t> result_d(result_ptr);
+
+    for (int i = 0; i < out_chn * (in_dim - 2); i++) {
+        int index[2] = { i / (in_dim - 2), i % (in_dim - 2) };
+        int32_t sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index[0] * in_chn + c;
+            for (int i = 0; i <= 1; i++) {
+                for (int j = 0; j <= 2; j++) {
+                    sum += filter_d[_fi * k_size + (i+1) * 3 + j] * input_d[c * in_dim * in_dim + (i * in_dim) + index[1] + j];
+                }
+            }
+        }
+
+        sum += bias_d[index[0]];
+        result_d[index[0] * in_dim * in_dim + index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index[0] * in_chn + c;
+            for (int i = -2; i <= -1; i++) {
+                for (int j = 0; j <= 2; j++) {
+                    sum += filter_d[_fi * k_size + (i + 2) * 3 + j] * input_d[c * in_dim * in_dim + (in_dim + i) * in_dim + index[1] + j];      
+                }
+            }
+        }
+
+        sum += bias_d[index[0]];
+        result_d[index[0] * in_dim * in_dim + (in_dim - 1) * in_dim + index[1] + 1] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index[0] * in_chn + c;
+            for (int i = 0; i <= 2; i++) {
+                for (int j = 0; j <= 1; j++) {
+                    sum += filter_d[_fi * k_size + i * 3 + j + 1] * input_d[c * in_dim * in_dim + (index[1] + i) * in_dim + j];        
+                }
+            }
+        }
+
+        sum += bias_d[index[0]];
+        result_d[index[0] * in_dim * in_dim + (index[1] + 1) * in_dim] = sum > 0 ? round(sum * scale) : 0;
+
+        sum = 0;
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index[0] * in_chn + c;
+            for (int i = 0; i <= 2; i++) {
+                for (int j = -2; j <= -1; j++) {
+                sum += filter_d[_fi * k_size + i * 3 + j + 2] * input_d[c * in_dim * in_dim + (index[1] + i) * in_dim + in_dim + j];        
+                }
+            }
+        }
+
+        sum += bias_d[index[0]];
+        result_d[index[0] * in_dim * in_dim + (index[1] + 1) * in_dim + in_dim - 1] = sum > 0 ? round(sum * scale) : 0;
+    }
+}
+
+template <int in_chn,
+          int in_dim,
+          int out_chn,
+          int k_size
+          >
+void ConvInterior (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale, int8_t* result_ptr){
+    device_ptr<int8_t> input_d(input_ptr);
+    device_ptr<int8_t> filter_d(filter_ptr);
+    device_ptr<int32_t> bias_d(bias_ptr);
+    device_ptr<int8_t> result_d(result_ptr);
+
+    for (int i = 0; i < (in_dim - 2) * (in_dim - 2); i++){
+        int index[3] = { i / ((in_dim - 2) * (in_dim - 2)), (i / (in_dim -2)) % (in_dim - 2), i % (in_dim - 2) };
+        int32_t sum = 0;
+        #pragma unroll 2 // Partial unrolling for the outermost loop.
+        for (int c = 0; c < in_chn; c++) {
+            int _fi = index[0] * in_chn + c;
+            #pragma unroll
+            for (int i = 0; i <= 2; i++) {
+                #pragma unroll
+                for (int j = 0; j <= 2; j++) {
+                    sum += filter_d[_fi * k_size + i * 3 + j] * input_d[c * in_dim * in_dim + (index[1] + i) * in_dim + index[2] + j];        
+                }
+            }
+        }
+
+        sum += bias_d[index[0]];
+        result_d[index[0] * in_dim * in_dim + (index[1] + 1) * in_dim + index[2] + 1] = sum > 0 ? round(sum * scale) : 0;
+    }
+}
+
+template <int chn, int in_dim>
+void MaxPool(int8_t *input_ptr, int8_t *result_ptr){
+    device_ptr<int8_t> in_d(input_ptr);
+    device_ptr<int8_t> result_d(result_ptr);
+
+    constexpr int out_dim = in_dim / 2;
+    for (int c = 0; c < chn; c++){
+        for (int y = 0; y < out_dim; y++){
+            for (int x = 0; x < out_dim; x++){
+                int8_t res = sycl::max(in_d[c*in_dim*in_dim + y*in_dim + x], in_d[c*in_dim*in_dim + y*in_dim + x]);
+                res = sycl::max(res, in_d[c*in_dim*in_dim + (y+1)*in_dim + x]);
+                res = sycl::max(res, in_d[c*in_dim*in_dim + (y+1)*in_dim + x + 1]);
+                result_d[c*out_dim*out_dim + y*out_dim + x] = res;
+            }
+        }
+    }
+}
 int main()
 {
     cout.precision(4);
 
-#if FPGA_SIMULATOR
-    auto selector = sycl::ext::intel::fpga_simulator_selector_v;
-#elif FPGA_HARDWARE
-    auto selector = sycl::ext::intel::fpga_selector_v;
-#elif CPU
-    auto selector = cpu_selector_v;
-#else // #if FPGA_EMULATOR
-    auto selector = sycl::ext::intel::fpga_emulator_selector_v;
-#endif
+    #if FPGA_SIMULATOR
+        auto selector = sycl::ext::intel::fpga_simulator_selector_v;
+    #elif FPGA_HARDWARE
+        auto selector = sycl::ext::intel::fpga_selector_v;
+    #elif CPU
+        auto selector = cpu_selector_v;
+    #else // #if FPGA_EMULATOR
+        auto selector = sycl::ext::intel::fpga_emulator_selector_v;
+    #endif
+
+    // Enable the queue profiling to time the execution
     property_list queue_properties{sycl::property::queue::enable_profiling()};
     queue q = sycl::queue(selector, exception_handler, queue_properties);
 
@@ -17453,9 +17044,9 @@ int main()
       std::terminate();
     }
     if (!device.get_info<info::device::usm_host_allocations>()) {
-      std::cerr << "ERROR: The selected device does not support USM host"
+        std::cerr << "ERROR: The selected device does not support USM host"
                 << " allocations\n";
-      std::terminate();
+        std::terminate();
     }
 
     std::cout << "Running on device: "
@@ -17481,67 +17072,363 @@ int main()
     int8_t *fc_weights = read_param_int8(rf_data);
 
     rf_data.close();
+    cout << "Model parameters read" << std::endl;
 
-    float *logits_f = new float[3];
-    float *upsampled_f = new float[15 * 224 * 224];
+    constexpr int img_dim = 224;
+    constexpr int c1_dim = img_dim/2;
+    constexpr int c2_dim = img_dim/4;
+
+    constexpr float c1_scale = 0.01979798823595047*0.013484773226082325/0.04881289601325989;
+    constexpr float c2_scale = 0.04881289601325989*0.0006907337228767574/0.016132580116391182;
+
+    constexpr int img_chn = 3;
+    constexpr int img_size = img_chn*img_dim*img_dim;    
+
+    constexpr int filter_size = 9;
+    constexpr int c1_chn = 64;
+    constexpr int c2_chn = 512;
+    constexpr int num_protos = 15;
+    constexpr int num_classes = 3;
+
+    std::vector<float> logits;
+    std::vector<float> upsampled_f;
+
+    logits.resize(num_classes);
+    upsampled_f.resize(num_protos*img_dim*img_dim);
+    cout << "Init outputs" << std::endl;
+
+    // Quantise the input.
+    float* img_f_ptr = malloc_device<float>(img_size, q);
+    int8_t* img_ptr = (int8_t*) malloc_device(img_size * sizeof(int8_t), q);
+
+    int8_t* conv1_f_ptr = (int8_t*) malloc_device(c1_chn * img_chn * filter_size * sizeof(int8_t), q);
+    int32_t* conv1_b_ptr = (int32_t*) malloc_device(img_chn * sizeof(int32_t), q);
+    int8_t* conved1_ptr = (int8_t*) malloc_device(c1_chn * img_dim * img_dim * sizeof(int8_t), q);
+
+    int8_t* pooled1_ptr = (int8_t*) malloc_device(c1_chn * c1_dim * c1_dim * sizeof(int8_t), q);
+
+    int8_t* conv2_f_ptr = (int8_t*) malloc_device(c2_chn * c1_chn * filter_size * sizeof(int8_t), q);
+    int32_t* conv2_b_ptr = (int32_t*) malloc_device(c1_chn * sizeof(int32_t), q);
+    int8_t* conved2_ptr = (int8_t*) malloc_device(c2_chn * c1_dim * c1_dim * sizeof(int8_t), q);
+
+    int8_t* pooled2_ptr = (int8_t*) malloc_device(c2_chn * c2_dim * c2_dim * sizeof(int8_t), q);
+
+    float* fm_ptr = (float*) malloc_device(c2_chn * c2_dim * c2_dim * sizeof(float), q);
+
+    float* sims_ptr = (float*) malloc_device(num_protos*c2_dim*c2_dim*sizeof(float), q);
+    float* proto_ptr = (float*) malloc_device(num_protos*c2_chn*sizeof(float), q);
+
+    int8_t* sim_score_ptr = (int8_t*) malloc_device(num_protos*sizeof(int8_t), q);
+
+    int8_t* weights_ptr = (int8_t*) malloc_device(num_classes * num_protos * sizeof(int8_t), q);
+    float* logits_ptr = (float*) malloc_device(num_classes*sizeof(float), q);
+    
+
 
     // Timings.
-    long times[N] = {};
+    double times[N] = {};
 
     for (int i = 0; i < N; i++)
     {
         auto start = high_resolution_clock::now();
 
         // Allocate device memory for input image
-        float* input_f_ptr = (float*) malloc_device(3 * 224 * 224 * sizeof(float), q);
-        auto input_to_device_event = q.memcpy(input_f_ptr, &input_f[0], 3*224*224 * sizeof(float));
-        input_to_device_event.wait();
+        auto img_to_device_event = q.memcpy(img_f_ptr, &input_f[0], img_size * sizeof(float));
 
-        // Quantise the input.
-        int8_t* input_ptr = quant(q, 3 * 224 * 224, 0.01979798823595047, input_f_ptr);
+        auto quant_event = q.submit([&](handler &h) {
+            h.depends_on(img_to_device_event);
+            h.single_task<class Quantise>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> img_d(img_f_ptr);
+                device_ptr<int8_t> result_d(img_ptr);
 
-        // Convolutional layers (* 2).
-        int8_t* conved1_ptr = conv_pad_q<Conv1ID, 3, 224, 64>(q, input_ptr, weights1, biases1, 0.01979798823595047, 0.013484773226082325, 0.04881289601325989);
-        int8_t* pooled1_ptr = max_pool_q(q, 64, 224, 224, conved1_ptr);
-        int8_t* conved2_ptr = conv_pad_q<64>(q, 112, pooled1_ptr, weights2, 512, biases2, 0.04881289601325989, 0.0006907337228767574, 0.016132580116391182);
-        int8_t* pooled2_ptr = max_pool_q(q, 512, 112, 112, conved2_ptr);
-        float *pooled2_f_ptr = dequant(q, 512 * 56 * 56, 0.016132580116391182, pooled2_ptr);
-
-        // Prototype layer.
-        float *distances_f_ptr = l2_distance(q, 512, 56 * 56, pooled2_f_ptr, 15, prototypes);
-        float *similarities_f_ptr = distance_2_similarity(q, 15 * 56 * 56, distances_f_ptr);
-        float *avg_f_ptr = top9_average_pooling(q, 15, 56 * 56, similarities_f_ptr);
-
-        // Compute upsampled activation map (information for interpretation).
-        upsample4(q, 15, 56, 56, similarities_f_ptr, upsampled_f);
-        
-
-        // Fully-connected layer.
-        int8_t *avg_ptr = quant(q, 15, 0.01979798823595047, avg_f_ptr);
-        int8_t *logits_ptr = fully_connected(q, 15, 3, avg_ptr, fc_weights);
-        float *logits_f_ptr = dequant(q, 3, 0.06617073714733124, logits_ptr);
-
-
-        // Compute min_distance (information for interpretation).
-        // bottom9_average_pooling(q, 15, 56 * 56, distances_f, avg_f);
-
-
-        q.wait();
-        auto logits_to_host = q.submit([&] (handler &h) {
-            h.memcpy(&logits_f[0], logits_f_ptr, 3 * sizeof(float));
+                for (int i = 0; i < img_size; i++){
+                    result_d[i] = round(img_d[i] / 0.01979798823595047);
+                }
+            });
         });
-        logits_to_host.wait();
+        
+        /* Carry out quantised convolution (with padding) between the TENSOR (1 * CHN * W * W) and the FILTER (D * CHN * 3 * 3), then ReLU. */
+        auto filter_to_device_event = q.memcpy(conv1_f_ptr, &weights1[0], c1_chn * img_chn * filter_size * sizeof(int8_t));
+        auto bias_to_device_event = q.memcpy(conv1_b_ptr, &biases1[0], img_chn * sizeof(int32_t));
 
+        auto c1_corner_event = q.submit([&](handler &h)
+        {
+            h.depends_on(quant_event);
+            h.depends_on(filter_to_device_event);
+            h.depends_on(bias_to_device_event);
+            
+            h.single_task<class Conv1Corner>([=]() [[intel::kernel_args_restrict]]{
+                ConvCorners<img_chn,img_dim,c1_chn,filter_size>(img_ptr, conv1_f_ptr, conv1_b_ptr, c1_scale, conved1_ptr);
+            });
+        });
+
+        auto c1_boundry_event = q.submit([&](handler &h) {
+            h.depends_on(quant_event);
+            h.depends_on(filter_to_device_event);
+            h.depends_on(bias_to_device_event);
+
+            h.single_task<class Conv1Bound>([=]() [[intel::kernel_args_restrict]]{
+                ConvBoundry<img_chn,img_dim,c1_chn, filter_size>(img_ptr, conv1_f_ptr, conv1_b_ptr, c1_scale, conved1_ptr);
+            });
+        });
+
+        auto c1_interior_event = q.submit([&](handler &h) {
+            h.depends_on(quant_event);
+            h.depends_on(filter_to_device_event);
+            h.depends_on(bias_to_device_event);
+
+            h.single_task<class Conv1Interior>([=]() [[intel::kernel_args_restrict]]{
+                ConvInterior<img_chn,img_dim,c1_chn, filter_size>(img_ptr, conv1_f_ptr, conv1_b_ptr, c1_scale, conved1_ptr);
+            });
+        });
+
+
+        // Max Pooling
+        auto pool1_event = q.submit([&](handler &h) {
+            h.depends_on(c1_corner_event);
+            h.depends_on(c1_boundry_event);
+            h.depends_on(c1_interior_event);
+            
+            h.single_task<class Maxpool1>([=]() [[intel::kernel_args_restrict]]{
+                MaxPool<c1_chn, img_dim>(conved1_ptr, pooled1_ptr);
+            });
+        });
+
+        filter_to_device_event = q.memcpy(conv2_f_ptr, &weights2[0], c2_chn * c1_chn * filter_size * sizeof(int8_t));
+        bias_to_device_event = q.memcpy(conv2_b_ptr, &biases2[0], c1_chn * sizeof(int32_t));
+
+        auto c2_corner_event = q.submit([&](handler &h)
+        {
+            h.depends_on(pool1_event);
+            h.depends_on(filter_to_device_event);
+            h.depends_on(bias_to_device_event);
+            
+            h.single_task<class Conv2Corner>([=]() [[intel::kernel_args_restrict]]{
+                ConvCorners<c1_chn,c1_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
+            });
+        });
+
+        auto c2_boundry_event = q.submit([&](handler &h) {
+            h.depends_on(pool1_event);
+            h.depends_on(filter_to_device_event);
+            h.depends_on(bias_to_device_event);
+
+            h.single_task<class Conv2Bound>([=]() [[intel::kernel_args_restrict]]{
+                ConvBoundry<c1_chn,c1_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
+            });
+        });
+
+        auto c2_interior_event = q.submit([&](handler &h) {
+            h.depends_on(pool1_event);
+            h.depends_on(filter_to_device_event);
+            h.depends_on(bias_to_device_event);
+
+            h.single_task<class Conv2Interior>([=]() [[intel::kernel_args_restrict]]{
+                ConvInterior<c1_chn,c1_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
+            });
+        });
+
+        // Max Pooling
+        auto pool2_event = q.submit([&](handler &h) {
+            h.depends_on(c2_corner_event);
+            h.depends_on(c2_boundry_event);
+            h.depends_on(c2_interior_event);
+            
+            h.single_task<class Maxpool2>([=]() [[intel::kernel_args_restrict]]{
+                MaxPool<c2_chn, c1_dim>(conved2_ptr, pooled2_ptr);
+            });
+        });
+
+        auto dequant_event = q.submit([&](handler &h) {
+            h.depends_on(pool2_event);
+            h.single_task<class Dequantise>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<int8_t> in_d(pooled2_ptr);
+                device_ptr<float> result_d(fm_ptr);
+
+                for (int i = 0; i < c2_chn*c2_dim*c2_dim; i++){
+                    result_d[i] = in_d[i] * 0.016132580116391182;
+                }
+            });
+        });
+
+        auto proto_to_device_event = q.memcpy(proto_ptr, &prototypes[0], num_protos*c2_chn*sizeof(float));
+        auto similarity_event = q.submit([&](handler &h) {
+            h.depends_on(proto_to_device_event);
+            h.depends_on(dequant_event);
+
+            h.single_task<class SimMap>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> in_d(fm_ptr);
+                device_ptr<float> proto_d(proto_ptr);
+                device_ptr<float> res_d(sims_ptr);
+
+                for (int p = 0; p < num_protos; p++){
+                    for (int y = 0; y < c2_dim; y++){
+                        for (int x = 0; x < c2_dim; x++){
+                            float res = 0.0f;
+                            for (int c = 0; c < c2_chn; c++){
+                                float dist = in_d[c*c2_dim*c2_dim + y*c2_dim + x] - proto_d[p*c2_chn+c];
+                                res += dist*dist;
+                            }
+                            res = sycl::sqrt(res);
+                            res_d[p*c2_dim*c2_dim + y*c2_dim + x] = sycl::log((res+1)/(res+0.0001f));
+                        }
+                    }
+                }
+            });
+
+        });
+
+        auto upsample_event = q.submit([&](handler &h) {
+            h.depends_on(similarity_event);
+
+            h.single_task<class Upsample1>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(sims_ptr);
+                device_ptr<float> result_d(upsample_ptr);
+                for (int index = 0; index < num_protos; index++){
+                    // auto _q = (index[1] + 2) / 4;
+                    for (int i = 0; i < 2; i++) {
+                        for (int j = 0; j < 2; j++){
+                            result_d[(index*c2_dim*c2_dim) + (i * c2_dim) + j] = tensor_d[index * c2_dim * c2_dim];
+                            result_d[(index * c2_dim * c2_dim) + (i * c2_dim) + 4 * c2_dim - 1 - j] = tensor_d[(index * c2_dim * c2_dim) + c2_dim - 1];
+                            result_d[(index * c2_dim * c2_dim) + (4 * c2_dim - 1 - i) * c2_dim + j] = tensor_d[(index * c2_dim * c2_dim) + (c2_dim - 1) * c2_dim];
+                            result_d[(index * c2_dim * c2_dim) + (4 * c2_dim - 1 - i) * c2_dim + 4 * c2_dim - 1 - j] = tensor_d[(index * c2_dim * c2_dim) + ((c2_dim - 1) * c2_dim) + c2_dim - 1];
+                        }
+                    }
+                }
+            });
+
+        });
+
+        auto upsample_event = q.submit([&](handler &h) {
+            h.depends_on(similarity_event);
+
+            h.single_task<class Upsample1>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> tensor_d(sims_ptr);
+                device_ptr<float> result_d(upsample_ptr);
+                for (int c = 0; c < num_protos; c++){
+                    for (int index = 0; index < (c2_dim * 4 - 4); index++){
+                        auto _r = 2* (index % 4) + 1;
+                        auto _q = index / 4;
+                        for (int i = 0; i < 2; i++){
+                            
+                        }
+                    }
+                }
+                    for (int i = 0; i < 2; i++) {
+                    result_d[(index[0] * row * col) + (i * col) + index[1] + 2] = (tensor_d[(index[0] * row * col) + _q] * (8 - _r) + tensor_d[(index[0] * row * col) + _q + 1] * _r) / 8;
+                    result_d[(index[0] * row * col) + (4 * row - 1 - i) * col + index[1] + 2] = (tensor_d[(index[0] * row * col) + (row - 1) * col + _q] * (8 - _r) + tensor_d[(index[0] * row * col) + (row - 1) * col + _q + 1] * _r) / 8;
+                    }
+                }
+            });
+
+        });
+
+        auto sim_score_event = q.submit([&](handler &h) {
+            h.depends_on(similarity_event);
+
+            h.single_task<class SimScore>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<float> in_d(sims_ptr);
+                device_ptr<int8_t> result_d(sim_score_ptr);
+
+                for (int c = 0; c < num_protos; c++){
+                    float r_[9];
+                    for (int i = 0; i < 9; i++) {
+                        r_[i] = in_d[c * c2_dim*c2_dim + i];
+                        int k = i;
+                        while (true) {
+                            if ((r_[k] >= r_[k / 2]) ) break;
+                            float temp = r_[k];
+                            r_[k] = r_[k / 2];
+                            r_[k / 2] = temp;
+                            k /= 2;
+                        }
+                    }
+                
+                    for (int i = 9; i < c2_dim*c2_dim; i++) {
+                        if (in_d[c * c2_dim*c2_dim + i] > r_[0]) {
+                            r_[0] = in_d[c * c2_dim*c2_dim + i];
+                            int k = 0;
+                            while (k < 9) {
+                                if (k >= 4) break;
+
+                                if (r_[k] > r_[2 * k + 1] || r_[k] > r_[2 * k + 2]) {
+                                    float temp = r_[k];
+                                    if (r_[2 * k + 1] < r_[2 * k + 2]) {
+                                        r_[k] = r_[2 * k + 1];
+                                        r_[2 * k + 1] = temp;
+                                        k = 2 * k + 1;
+                                    } else {
+                                        r_[k] = r_[2 * k + 2];
+                                        r_[2 * k + 2] = temp;
+                                        k = 2 * k + 2;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    float res = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+                    result_d[c] = round(res / 0.01979798823595047);
+                }
+            });
+        });
+
+        //fully connected
+        auto weights_to_device_event = q.memcpy(weights_ptr, &fc_weights[0], num_classes * num_protos * sizeof(int8_t));
+        auto fc_event = q.submit([&](handler &h) {
+            h.depends_on(sim_score_event);
+            h.depends_on(weights_to_device_event);
+
+            h.single_task<class FC>([=]() [[intel::kernel_args_restrict]]{
+                device_ptr<int8_t> in_d(sim_score_ptr);
+                device_ptr<int8_t> w_d(weights_ptr);
+                device_ptr<float> result_d(logits_ptr);
+
+                for (int index = 0; index < num_classes; index++){
+                    // The scales are hardcoded for the sole fully-connected layer of our model.
+                    int32_t sum = 0;
+                    for (int i = 0; i < num_protos; i++) {
+                        sum += in_d[i] * w_d[index * num_protos + i];
+                    }
+                    result_d[index] = sum * 0.01979798823595047*0.009601877070963383;
+                }
+            });
+        });
+        fc_event.wait();
         auto stop = high_resolution_clock::now();
         times[i] = duration_cast<microseconds>(stop - start).count();
     }
 
-    // Print out the output.
-    peek(1, 3, logits_f, true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
-    // peek(1, 15, avg_f, false);
-    peek(224, 224, upsampled_f, true);
-    peek(224, 224, upsampled_f + 224 * 224, true);
-    peek(224, 224, upsampled_f + 14 * 224 * 224, true);
+    auto logits_to_host = q.submit([&] (handler &h) {
+        h.memcpy(logits.data(), logits_ptr, num_classes*sizeof(float));
+    });
+    logits_to_host.wait();
+
+
+    free(img_f_ptr, q);
+    free(img_ptr, q);
+    free(conv1_f_ptr, q);
+    free(conv1_b_ptr, q);
+    free(conved1_ptr, q);
+    free(pooled1_ptr, q);
+    free(conv2_f_ptr, q);
+    free(conv2_b_ptr, q);
+    free(conved2_ptr, q);
+    free(pooled2_ptr, q);
+    free(fm_ptr, q);
+    free(sims_ptr, q);
+    free(proto_ptr, q);
+    free(sim_score_ptr, q);
+    free(weights_ptr, q);
+    free(logits_ptr, q);
+
+    //Print out the output.
+    peek(1, 3, &logits[0], true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
+    // // peek(1, 15, avg_f, false);
+    // peek(224, 224, upsampled_f, true);
+    // peek(224, 224, upsampled_f + 224 * 224, true);
+    // peek(224, 224, upsampled_f + 14 * 224 * 224, true);
 
     // Output timings.
     long total = 0;
@@ -17559,9 +17446,6 @@ int main()
     delete[] biases2;
     delete[] prototypes;
     delete[] fc_weights;
-
-    delete[] logits_f;
-    delete[] upsampled_f;
 
     return 0;
 }

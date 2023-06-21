@@ -1,4 +1,4 @@
-#include <CL/sycl.hpp>
+#include <sycl/sycl.hpp>
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -7,10 +7,14 @@
 #include <oneapi/dpl/random>
 #include <oneapi/mkl.hpp>
 #include <cinttypes>
-#include "input_handler.hpp"
-#if FPGA || FPGA_EMULATOR
+
 #include <sycl/ext/intel/fpga_extensions.hpp>
-#endif
+
+#include "aiaibl.hpp"
+#include "params.hpp"
+#include "input_handler.hpp"
+#include "utils.hpp"
+#include "constants.hpp"
 
 using namespace std::chrono;
 using namespace std;
@@ -18,42 +22,6 @@ using namespace sycl;
 
 // Number of iterations.
 #define N 1
-
-/* Show the matrix. If snapshot = true, only shwo the first 5 * 5 corner. */
-void peek(int row, int col, float *matrix, bool snapshot) {
-  int peek_level = 16;
-  for (int i = 0; i < (snapshot && row > peek_level ? peek_level : row); i++) {
-    for (int j = 0; j < (snapshot && col > peek_level ? peek_level : col); j++) {
-      cout << std::fixed << matrix[i * col + j] << "\t";
-    }
-    if (col > peek_level && snapshot) {
-      cout << "...";
-    }
-    cout << std::endl;
-  }
-  if (row > peek_level && snapshot) {
-    cout << "...";
-  }
-  cout << std::endl;
-}
-
-/* Show the matrix. If snapshot = true, only shwo the first 5 * 5 corner. */
-void peek_int(int row, int col, int8_t *matrix, bool snapshot) {
-  for (int i = 0; i < (snapshot && row > 5 ? 5 : row); i++) {
-    for (int j = 0; j < (snapshot && col > 5 ? 5 : col); j++) {
-      cout << std::fixed << (int32_t)(matrix[i * col + j]) << "\t";
-    }
-    if (col > 5 && snapshot) {
-      cout << "...";
-    }
-    cout << std::endl;
-  }
-  if (row > 5 && snapshot) {
-    cout << "...";
-  }
-  cout << std::endl;
-}
-
 
 /* Carry out MaxPool on the given TENSOR (C * H * W) with a stride of 2. */
 void max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor, int8_t *result) {
@@ -123,176 +91,176 @@ void dequant(queue &q, int size, float scale, int8_t *tensor, float *result) {
 }
 
 /* Carry out quantised convolution (with padding) between the TENSOR (1 * CHN * W * W) and the FILTER (D * CHN * 3 * 3), then ReLU. */
-void conv_pad_q(queue &q, int chn, int size, int8_t *tensor, int8_t *filter, int d, int32_t *biases, float tensor_scale, float filter_scale, float result_scale, int8_t *result) {
-  {
-    buffer m_buf(tensor, range(chn, size, size));
-    buffer f_buf(filter, range(d * chn, 3, 3));
-    buffer b_buf(biases, range(d));
-    buffer r_buf(result, range(d, size, size));
+// void conv_pad_q(queue &q, int chn, int size, int8_t *tensor, int8_t *filter, int d, int32_t *biases, float tensor_scale, float filter_scale, float result_scale, int8_t *result) {
+//   {
+//     buffer inp_b(inp, range(chn, in_dim, in_dim));
+//     buffer f_buf(filter, range(out_chn, in_chn, 3, 3));
+//     buffer b_buf(biases, range(out_chn));
+//     buffer r_buf(result, range(out_chn, in_dim, in_dim));
 
-    q.submit([&](auto &h) {
-      accessor m(m_buf, h, read_only);
-      accessor f(f_buf, h, read_only);
-      accessor b(b_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
+//     q.submit([&](auto &h) {
+//       accessor i(inp_b, h, read_only);
+//       accessor f(f_buf, h, read_only);
+//       accessor b(b_buf, h, read_only);
+//       accessor r(r_buf, h, write_only);
 
-      // Task for the corner elements
-      h.single_task([=]() {
-        for (int filter_d = 0; filter_d < d; filter_d++){
-            int32_t sum = 0;
-            const float scale = tensor_scale * filter_scale / result_scale;
-            for (int c = 0; c < chn; c++) {
-            int _fi = filter_d * chn + c;
-            for (int i = 0; i <= 1; i++) {
-                for (int j = 0; j <= 1; j++) {
-                sum += f[_fi][i + 1][j + 1] * m[c][i][j];        
-                }
-            }
-            }
+//       // Task for the corner elements
+//       h.single_task([=]() {
+//         for (int filter_d = 0; filter_d < d; filter_d++){
+//             int32_t sum = 0;
+//             const float scale = tensor_scale * filter_scale / result_scale;
+//             for (int c = 0; c < chn; c++) {
+//             int _fi = filter_d * chn + c;
+//             for (int i = 0; i <= 1; i++) {
+//                 for (int j = 0; j <= 1; j++) {
+//                 sum += f[_fi][i + 1][j + 1] * m[c][i][j];        
+//                 }
+//             }
+//             }
 
-            sum += b[filter_d];
-            r[filter_d][0][0] = sum > 0 ? round(sum * scale) : 0;
+//             sum += b[filter_d];
+//             r[filter_d][0][0] = sum > 0 ? round(sum * scale) : 0;
 
-            sum = 0;
-            for (int c = 0; c < chn; c++) {
-            int _fi = filter_d * chn + c;
-            for (int i = 0; i <= 1; i++) {
-                for (int j = -2; j <= -1; j++) {
-                sum += f[_fi][i + 1][j + 2] * m[c][i][size + j];        
-                }
-            }
-            }
+//             sum = 0;
+//             for (int c = 0; c < chn; c++) {
+//             int _fi = filter_d * chn + c;
+//             for (int i = 0; i <= 1; i++) {
+//                 for (int j = -2; j <= -1; j++) {
+//                 sum += f[_fi][i + 1][j + 2] * m[c][i][size + j];        
+//                 }
+//             }
+//             }
 
-            sum += b[filter_d];
-            r[filter_d][0][size - 1] = sum > 0 ? round(sum * scale) : 0;
+//             sum += b[filter_d];
+//             r[filter_d][0][size - 1] = sum > 0 ? round(sum * scale) : 0;
 
-            sum = 0;
-            for (int c = 0; c < chn; c++) {
-            int _fi = filter_d * chn + c;
-            for (int i = -2; i <= -1; i++) {
-                for (int j = 0; j <= 1; j++) {
-                sum += f[_fi][i + 2][j + 1] * m[c][size + i][j];        
-                }
-            }
-            }
+//             sum = 0;
+//             for (int c = 0; c < chn; c++) {
+//             int _fi = filter_d * chn + c;
+//             for (int i = -2; i <= -1; i++) {
+//                 for (int j = 0; j <= 1; j++) {
+//                 sum += f[_fi][i + 2][j + 1] * m[c][size + i][j];        
+//                 }
+//             }
+//             }
 
-            sum += b[filter_d];
-            r[filter_d][size - 1][0] = sum > 0 ? round(sum * scale) : 0;
+//             sum += b[filter_d];
+//             r[filter_d][size - 1][0] = sum > 0 ? round(sum * scale) : 0;
 
-            sum = 0;
-            for (int c = 0; c < chn; c++) {
-            int _fi = filter_d * chn + c;
-            for (int i = -2; i <= -1; i++) {
-                for (int j = -2; j <= -1; j++) {
-                sum += f[_fi][i + 2][j + 2] * m[c][size + i][size + j];        
-                }
-            }
-            }
+//             sum = 0;
+//             for (int c = 0; c < chn; c++) {
+//             int _fi = filter_d * chn + c;
+//             for (int i = -2; i <= -1; i++) {
+//                 for (int j = -2; j <= -1; j++) {
+//                 sum += f[_fi][i + 2][j + 2] * m[c][size + i][size + j];        
+//                 }
+//             }
+//             }
 
-            sum += b[filter_d];
-            r[filter_d][size - 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
-        }
-      });
-    });
+//             sum += b[filter_d];
+//             r[filter_d][size - 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
+//         }
+//       });
+//     });
 
-    // Task for the boundary elements.
-    q.submit([&](auto &h) {
-      accessor m(m_buf, h, read_only);
-      accessor f(f_buf, h, read_only);
-      accessor b(b_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
+//     // Task for the boundary elements.
+//     q.submit([&](auto &h) {
+//       accessor m(m_buf, h, read_only);
+//       accessor f(f_buf, h, read_only);
+//       accessor b(b_buf, h, read_only);
+//       accessor r(r_buf, h, write_only);
 
-      h.single_task([=]() {
-        for (int filter_d = 0; filter_d < d; filter_d++){
-            for (int x = 0; x < size - 2; x++){
-                int32_t sum = 0;
-                const float scale = tensor_scale * filter_scale / result_scale;
-                for (int c = 0; c < chn; c++) {
-                int _fi = filter_d * chn + c;
-                for (int i = 0; i <= 1; i++) {
-                    for (int j = 0; j <= 2; j++) {
-                    sum += f[_fi][i + 1][j] * m[c][i][x + j];        
-                    }
-                }
-                }
+//       h.single_task([=]() {
+//         for (int filter_d = 0; filter_d < d; filter_d++){
+//             for (int x = 0; x < size - 2; x++){
+//                 int32_t sum = 0;
+//                 const float scale = tensor_scale * filter_scale / result_scale;
+//                 for (int c = 0; c < chn; c++) {
+//                 int _fi = filter_d * chn + c;
+//                 for (int i = 0; i <= 1; i++) {
+//                     for (int j = 0; j <= 2; j++) {
+//                     sum += f[_fi][i + 1][j] * m[c][i][x + j];        
+//                     }
+//                 }
+//                 }
 
-                sum += b[filter_d];
-                r[filter_d][0][x + 1] = sum > 0 ? round(sum * scale) : 0;
+//                 sum += b[filter_d];
+//                 r[filter_d][0][x + 1] = sum > 0 ? round(sum * scale) : 0;
 
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                int _fi = filter_d * chn + c;
-                for (int i = -2; i <= -1; i++) {
-                    for (int j = 0; j <= 2; j++) {
-                    sum += f[_fi][i + 2][j] * m[c][size + i][x + j];        
-                    }
-                }
-                }
+//                 sum = 0;
+//                 for (int c = 0; c < chn; c++) {
+//                 int _fi = filter_d * chn + c;
+//                 for (int i = -2; i <= -1; i++) {
+//                     for (int j = 0; j <= 2; j++) {
+//                     sum += f[_fi][i + 2][j] * m[c][size + i][x + j];        
+//                     }
+//                 }
+//                 }
 
-                sum += b[filter_d];
-                r[filter_d][size - 1][x + 1] = sum > 0 ? round(sum * scale) : 0;
+//                 sum += b[filter_d];
+//                 r[filter_d][size - 1][x + 1] = sum > 0 ? round(sum * scale) : 0;
 
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                int _fi = filter_d * chn + c;
-                for (int i = 0; i <= 2; i++) {
-                    for (int j = 0; j <= 1; j++) {
-                    sum += f[_fi][i][j + 1] * m[c][x + i][j];        
-                    }
-                }
-                }
+//                 sum = 0;
+//                 for (int c = 0; c < chn; c++) {
+//                 int _fi = filter_d * chn + c;
+//                 for (int i = 0; i <= 2; i++) {
+//                     for (int j = 0; j <= 1; j++) {
+//                     sum += f[_fi][i][j + 1] * m[c][x + i][j];        
+//                     }
+//                 }
+//                 }
 
-                sum += b[filter_d];
-                r[filter_d][x + 1][0] = sum > 0 ? round(sum * scale) : 0;
+//                 sum += b[filter_d];
+//                 r[filter_d][x + 1][0] = sum > 0 ? round(sum * scale) : 0;
 
-                sum = 0;
-                for (int c = 0; c < chn; c++) {
-                int _fi = filter_d * chn + c;
-                for (int i = 0; i <= 2; i++) {
-                    for (int j = -2; j <= -1; j++) {
-                    sum += f[_fi][i][j + 2] * m[c][x + i][size + j];        
-                    }
-                }
-                }
+//                 sum = 0;
+//                 for (int c = 0; c < chn; c++) {
+//                 int _fi = filter_d * chn + c;
+//                 for (int i = 0; i <= 2; i++) {
+//                     for (int j = -2; j <= -1; j++) {
+//                     sum += f[_fi][i][j + 2] * m[c][x + i][size + j];        
+//                     }
+//                 }
+//                 }
 
-                sum += b[filter_d];
-                r[filter_d][x + 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
-            }
-        }
-      });
-    });
+//                 sum += b[filter_d];
+//                 r[filter_d][x + 1][size - 1] = sum > 0 ? round(sum * scale) : 0;
+//             }
+//         }
+//       });
+//     });
 
-    // Task for interior elements (that uses all 3 * 3 filters).
-    q.submit([&](auto &h) {
-      accessor m(m_buf, h, read_only);
-      accessor f(f_buf, h, read_only);
-      accessor b(b_buf, h, read_only);
-      accessor r(r_buf, h, write_only);
+//     // Task for interior elements (that uses all 3 * 3 filters).
+//     q.submit([&](auto &h) {
+//       accessor m(m_buf, h, read_only);
+//       accessor f(f_buf, h, read_only);
+//       accessor b(b_buf, h, read_only);
+//       accessor r(r_buf, h, write_only);
 
-      h.single_task([=]() {
-        for (int filter_d = 0; filter_d < d; filter_d++){
-            for (int y = 0; y < size - 2; y++){
-                for (int x = 0; x < size - 2; x++){
-                    int32_t sum = 0;
-                    const float scale = tensor_scale * filter_scale / result_scale;
-                    for (int c = 0; c < chn; c++) {
-                    int _fi = filter_d * chn + c;
-                    for (int i = 0; i <= 2; i++) {
-                        for (int j = 0; j <= 2; j++) {
-                        sum += f[_fi][i][j] * m[c][y + i][x + j];        
-                        }
-                    }
-                    }
+//       h.single_task([=]() {
+//         for (int filter_d = 0; filter_d < d; filter_d++){
+//             for (int y = 0; y < size - 2; y++){
+//                 for (int x = 0; x < size - 2; x++){
+//                     int32_t sum = 0;
+//                     const float scale = tensor_scale * filter_scale / result_scale;
+//                     for (int c = 0; c < chn; c++) {
+//                     int _fi = filter_d * chn + c;
+//                     for (int i = 0; i <= 2; i++) {
+//                         for (int j = 0; j <= 2; j++) {
+//                         sum += f[_fi][i][j] * m[c][y + i][x + j];        
+//                         }
+//                     }
+//                     }
 
-                    sum += b[filter_d];
-                    r[filter_d][y + 1][x + 1] = sum > 0 ? round(sum * scale) : 0;
-                }
-            }
-        }
-      });
-    });
-  }
-}
+//                     sum += b[filter_d];
+//                     r[filter_d][y + 1][x + 1] = sum > 0 ? round(sum * scale) : 0;
+//                 }
+//             }
+//         }
+//       });
+//     });
+//   }
+// }
 
 /* Carry out the calculation for a fully-connected layer. */
 void fully_connected(queue &q, int c_in, int c_out, int8_t *vector,
@@ -508,32 +476,6 @@ void upsample4(queue &q, int chn, int row, int col, float *tensor, float *result
   }
 }
 
-// Read int32 parameters from the given input stream.
-int32_t *read_param_int32(ifstream &rf) {
-  int len;
-  rf.read((char *)(&len), 4);
-  int32_t *result = new int32_t[len];
-  rf.read((char *)result, len * 4);
-  return result;
-}
-
-// Read int8 parameters from the given input stream.
-int8_t *read_param_int8(ifstream &rf) {
-  int len;
-  rf.read((char *)(&len), 4);
-  int8_t *result = new int8_t[len];
-  rf.read((char *)result, len);
-  return result;
-}
-
-// Read float (non-quantised) parameters from the given input stream.
-float *read_param_float(ifstream &rf) {
-  int len;
-  rf.read((char *)(&len), 4);
-  float *result = new float[len];
-  rf.read((char *)result, len * 4);
-  return result;
-}
 
 int main() {
   cout.precision(4);
@@ -570,7 +512,7 @@ int main() {
               << std::endl;
 
   // The file that encodes all parameters of the model.
-  ifstream rf_data("data/model_params_quant.mmzk", ios::out | ios::binary);
+  ifstream rf_data("data/model_params_quant.mmzk", ios::binary);
   if(!rf_data) {
     cout << "Cannot open file!" << std::endl;
     return 1;
@@ -614,9 +556,9 @@ int main() {
     quant(q, 3 * 224 * 224, 0.01979798823595047, input_f, input);
 
     // Convolutional layers (* 2).
-    conv_pad_q(q, 3, 224, input, weights1, 64, biases1, 0.01979798823595047, 0.013484773226082325, 0.04881289601325989, conved1);
+    conv_cond(q, 3, 224, 224, input, 64, 3, weights1, biases1, conved1);
     max_pool_q(q, 64, 224, 224, conved1, pooled1);
-    conv_pad_q(q, 64, 112, pooled1, weights2, 512, biases2, 0.04881289601325989, 0.0006907337228767574, 0.016132580116391182, conved2);
+    conv_cond(q, 64, 112, 112, pooled1, 512, 3, weights2, biases2, conved2);
     max_pool_q(q, 512, 112, 112, conved2, pooled2);
     dequant(q, 512 * 56 * 56, 0.016132580116391182, pooled2, pooled2_f);
 
@@ -641,24 +583,24 @@ int main() {
   }
 
   // Print out the output.
-  cout << "\n############################## Input: \n";
-  peek_int(224,224,input, true);
-  cout << "\n############################## Conved1: \n";
-  peek_int(224,224,conved1, true);
-  cout << "\n############################## Pool1: \n";
-  peek_int(112,112,pooled1, true);
-  cout << "\n############################## Conved2: \n";
-  peek_int(112,112,conved2, true);
-  cout << "\n############################## Pool2: \n";
-  peek_int(56,56,pooled2, true);
-  cout << "\n############################## Similarities: \n";
-  peek(56,56,similarities_f, true);
-  cout << "\n############################## Sim Scores: \n";
-  peek_int(1, 15, avg, false);
-  cout << "\n############################## Logits: \n";
-  peek(1, 3, logits_f, true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
-  cout << "\n############################## Upsample: \n";
-  peek(224, 224, upsampled_f, true);
+//   cout << "\n############################## Input: \n";
+//   peek_int(224,224,input, true);
+//   cout << "\n############################## Conved1: \n";
+//   peek_int(224,224,conved1, true);
+//   cout << "\n############################## Pool1: \n";
+//   peek_int(112,112,pooled1, true);
+//   cout << "\n############################## Conved2: \n";
+//   peek_int(112,112,conved2, true);
+//   cout << "\n############################## Pool2: \n";
+//   peek_int(56,56,pooled2, true);
+//   cout << "\n############################## Similarities: \n";
+//   peek(56,56,similarities_f, true);
+//   cout << "\n############################## Sim Scores: \n";
+//   peek_int(1, 15, avg, false);
+//   cout << "\n############################## Logits: \n";
+//   peek(1, 3, logits_f, true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
+//   cout << "\n############################## Upsample: \n";
+//   peek(224, 224, upsampled_f, true);
 //   cout << "\n##############################Input: \n";
 //   peek(224, 224, upsampled_f + 224 * 224, true);
 //   peek(224, 224, upsampled_f + 14 * 224 * 224, true);
