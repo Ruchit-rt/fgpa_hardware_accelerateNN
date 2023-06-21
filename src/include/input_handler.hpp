@@ -1,6 +1,10 @@
 #ifndef __INPUT_HANDLER_HPP__
 #define __INPUT_HANDLER_HPP__
 
+
+#include <opencv2/opencv.hpp>
+
+
 // The test input, a flattened and normalised 3 * 448 * 448 image. It is a picture of a carrot.
 float input_f[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.5451, 0.5569,
                    0.5490, 0.5765, 0.5922, 0.5725, 0.5686, 0.5686, 0.5451, 0.5451, 0.5333,
@@ -16683,5 +16687,32 @@ float input_f[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.545
                    0.0510, 0.0549, 0.0275, 0.0078, 0.0235, 0.0431, 0.0863, 0.1059, 0.0824,
                    0.0588, 0.0667, 0.0863, 0.0980, 0.1137, 0.1294, 0.1451, 0.1608, 0.1451,
                    0.0824, 0.0235, 0.0078};
+
+float *load_image(int i) {
+    float imageArray[224*224*3];
+    cv::Mat image = cv::imread("images/test/veg_" + std:to_string(i), cv::IMREAD_COLOR);
+
+    if (image.empty()) {
+        std::cout << "Failed to load image" << std::endl;
+        return false;
+    }
+
+    cv::resize(image, image, cv::Size(width, height));
+    image.convertTo(image, CV_32FC3, 1.0 / 255.0);
+
+    int index = 0;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            cv::Vec3f pixel = image.at<cv::Vec3f>(y, x);
+            for (int c = 0; c < channels; c++) {
+                imageArray[index] = pixel[c];
+                index++;
+            }
+        }
+    }
+
+    return imageArray;
+}
+
 
 #endif

@@ -17,6 +17,39 @@ using namespace std::chrono;
 using namespace std;
 using namespace sycl;
 
+
+void conv_cond(queue &q, int chn, int row, int col, int8_t *tensor,
+    int d, int size, int8_t *filter, int32_t *biases, int8_t *result) {
+  {
+    buffer m_buf(tensor, range(chn, row, col));
+    buffer f_buf(filter, range(d * chn, size, size));
+    buffer b_buf(biases, range(d));
+    buffer r_buf(result, range(d, row, col));
+    q.submit([&](auto &h) {
+      accessor m(m_buf, h, read_only);
+      accessor f(f_buf, h, read_only);
+      accessor b(b_buf, h, read_only);
+      accessor r(r_buf, h, write_only);
+
+      h.parallel_for(range(d, row, col), [=](auto index) {
+        float sum = 0.0f;
+        int _d = index[0];
+        int _batch = index[0] / d;
+        for (int c = 0; c < chn; c++) {
+          for (int i = - size / 2; i <= size / 2; i++) {
+            for (int j = - size / 2; j <= size / 2; j++) {
+              if (index[1] + i < row && index[2] + j < col) {
+                sum += f[_d * chn + c][i + size / 2][j + size / 2] * m[_batch * chn + c][index[1] + i][index[2] + j];
+              }
+            }
+          }
+        }
+        r[index] = sum + b[_d];
+      });
+    });
+  }
+}
+
 template <int in_chn,
           int in_dim,
           int out_chn,
@@ -198,7 +231,7 @@ template <int in_chn,
           int k_size
           >
 void Conv (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale, int8_t* result_ptr){
-    #pragma clang fp contract(fast)
+    // #pragma clang fp contract(fast)
     device_ptr<int8_t> input_d(input_ptr);
     device_ptr<int8_t> filter_d(filter_ptr);
     device_ptr<int32_t> bias_d(bias_ptr);
@@ -230,18 +263,11 @@ void Conv (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, float scale
                     [[intel::fpga_register]]
                     const int _c = c * in_dim * in_dim;
 
-                    // Load current channel into local memory
-                    int8_t inp_c[in_dim*in_dim];
-                    for (int i = 0; i < in_dim*in_dim;i++){
-                        inp_c[i] = input_d[_c+i];
-                    }
-                    [[intel::fpga_register]]
-                    const int _fi = in_chn * k_size;
                     #pragma unroll
                     for (int i = 0; i <= 2; i++) {
                         #pragma unroll
                         for (int j = 0; j <= 2; j++) {
-                            sum += filter[_fi + i * 3 + j] * inp_c[_c + (y + i) * in_dim + j];        
+                            sum += filter[i * 3 + j] * input_d[_c + (y + i) * in_dim + x + j];    
                         }
                     }
                 }
@@ -355,7 +381,7 @@ void Conv_reg_shift (int8_t *input_ptr, int8_t *filter_ptr, int32_t *bias_ptr, f
                         sum += shift_reg[y_off*buff_dim + x_off + x] * filter_d[outc * kernel[y_off*3+x_off]];
                     }
                 }
-                result_d[outc*in_dim*in_dim + (in_dim-1)*in_dim + x] = sum > 0 ? round(sum * scale) : 0;
+                result_d[outc*in_dim*in_dim + (in_dim-1)*in_dim + x] = sum > 0 ? sum * scale : 0;
             }
 
         }
@@ -370,14 +396,13 @@ void MaxPool(int8_t *input_ptr, int8_t *result_ptr){
 
     constexpr int out_dim = in_dim / 2;
     for (int c = 0; c < chn; c++){
-        for (int y = 0; y < out_dim; y++){
+        for (int y = 0; y < in_dim; y+=2){
             #pragma unroll 2
-            [[intel::ivdep]]
-            for (int x = 0; x < out_dim; x++){
-                int8_t res = sycl::max(in_d[c*in_dim*in_dim + y*in_dim + x], in_d[c*in_dim*in_dim + y*in_dim + x]);
+            for (int x = 0; x < in_dim; x+=2){
+                int8_t res = sycl::max(in_d[c*in_dim*in_dim + y*in_dim + x], in_d[c*in_dim*in_dim + y*in_dim + x+ 1]);
                 res = sycl::max(res, in_d[c*in_dim*in_dim + (y+1)*in_dim + x]);
                 res = sycl::max(res, in_d[c*in_dim*in_dim + (y+1)*in_dim + x + 1]);
-                result_d[c*out_dim*out_dim + y*out_dim + x] = res;
+                result_d[c*out_dim*out_dim + y/2*out_dim + x/2] = res;
             }
         }
     }

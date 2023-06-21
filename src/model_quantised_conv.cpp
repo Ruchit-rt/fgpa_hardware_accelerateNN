@@ -80,19 +80,25 @@ int main()
     rf_data.close();
     cout << "Model parameters read" << std::endl;
 
-    std::vector<float> logits;
-    std::vector<float> upsample;
+    std::vector<float> logits, upsample;
+    // std::vector<int8_t> img, conved1, pooled1, conved2, pooled2;
+    // std::vector<float> simmap, simscore;
 
     logits.resize(num_classes);
     upsample.resize(num_protos*img_dim*img_dim);
+    // img.resize(img_chn*img_dim*img_dim);
+    // conved1.resize(c1_chn*img_dim*img_dim);
+    // pooled1.resize(c1_chn*c1_pad_dim*c1_pad_dim);
+    // conved2.resize(c2_chn*c1_dim*c1_dim);
     cout << "Init outputs" << std::endl;
 
     /*
     Allocate memory and copy onto device for the network parameters and layers 
     */
-    float* img_f_ptr = malloc_host<float>(img_size, q);
+    float* img_f_ptr = malloc_host<float>(img_size, q.get_context());
+    memcpy(img_f_ptr, input_f, img_size*sizeof(float));
     int8_t* img_ptr = (int8_t*) malloc_device(img_pad_size * sizeof(int8_t), q);
-    // for (int i = 0; i < img_pad_size; i++) img_ptr[i] = 0;
+    q.fill<int8_t>(img_ptr, 0, img_pad_size).wait();
     
     int8_t* conv1_f_ptr = (int8_t*) malloc_device(c1_chn * img_chn * filter_size * sizeof(int8_t), q);
     int32_t* conv1_b_ptr = (int32_t*) malloc_device(img_chn * sizeof(int32_t), q);
@@ -101,7 +107,7 @@ int main()
     auto bias1_to_device_event = q.memcpy(conv1_b_ptr, &biases1[0], img_chn * sizeof(int32_t));
 
     int8_t* pooled1_ptr = (int8_t*) malloc_device(c1_chn * c1_pad_dim * c1_pad_dim * sizeof(int8_t), q);
-    // for (int i = 0; i < c1_chn*c1_pad_dim*c1_pad_dim; i++) pooled1_ptr[i] = 0;
+    q.fill<int8_t>(pooled1_ptr, 0, c1_chn * c1_pad_dim * c1_pad_dim).wait();
 
     int8_t* conv2_f_ptr = (int8_t*) malloc_device(c2_chn * c1_chn * filter_size * sizeof(int8_t), q);
     int32_t* conv2_b_ptr = (int32_t*) malloc_device(c1_chn * sizeof(int32_t), q);
@@ -126,15 +132,11 @@ int main()
     float* upsample_ptr = (float*) malloc_device(num_protos*img_dim*img_dim*sizeof(float), q);
 
     cout << "Pointers initialised\n";
-
     // Timings.
     double times[N] = {};
 
     for (int i = 0; i < N; i++)
     {
-        auto start = high_resolution_clock::now();
-
-        // Copy input image into device (TODO: stream from host instead)
         /*
             Quantise the image
         */
@@ -145,7 +147,6 @@ int main()
 
                 for(int c = 0; c < img_chn; c++){
                     for (int y = 0; y < img_dim; y++){
-                        [[intel::ivdep]]
                         for (int x = 0; x < img_dim; x++){
                             result_d[c*img_pad_chn_size + (1+y)*img_pad_dim + x+1] = round(img_d[c*img_chn_size+ y*img_dim + x] / 0.01979798823595047);
                         }
@@ -158,7 +159,7 @@ int main()
             Convolute image with 3x3xc1_chn filter and zero-padding, quantise and ReLU output features
         */
 
-        auto c1_corner_event = q.submit([&](handler &h)
+        auto c1_event = q.submit([&](handler &h)
         {
             h.depends_on(quant_event);
             h.depends_on(filter1_to_device_event);
@@ -169,37 +170,46 @@ int main()
             });
         });
 
+        q.wait();
+        q.submit([&] (handler &h) {
+            h.memcpy(conved1.data(), conved1_ptr, c1_chn*img_dim*img_dim*sizeof(int8_t));
+        }).wait();
+        peek_int(img_dim, img_dim, &conved1[0], true);
+
         /*
             Max Pooling with stride 2 on feature map
         */
         auto pool1_event = q.submit([&](handler &h) {
-            h.depends_on(c1_corner_event);
+            h.depends_on(c1_event);
 
             h.single_task<class Maxpool1>([=]() [[intel::kernel_args_restrict]]{
                 device_ptr<int8_t> in_d(conved1_ptr);
                 device_ptr<int8_t> result_d(pooled1_ptr);
 
-                constexpr int out_dim = img_dim / 2;
                 for (int c = 0; c < c1_chn; c++){
-                    constexpr int _c = (out_dim+2)*(out_dim+2);
-                    for (int y = 0; y < out_dim; y++){
+                    for (int y = 0; y < c1_dim; y++){
                         #pragma unroll 2
-                        [[intel::ivdep]]
-                        for (int x = 0; x < out_dim; x++){
-                            int8_t res = sycl::max(in_d[c*img_dim*img_dim + y*img_dim + x], in_d[c*img_dim*img_dim + y*img_dim + x]);
-                            res = sycl::max(res, in_d[c*img_dim*img_dim + (y+1)*img_dim + x]);
-                            res = sycl::max(res, in_d[c*img_dim*img_dim + (y+1)*img_dim + x + 1]);
-                            result_d[_c*c + (y+1)*(out_dim+2) + x+1] = res;
+                        for (int x = 0; x < c1_dim; x++){
+                            int8_t res = sycl::max(in_d[c*img_chn_size + y*2*img_dim + x*2], in_d[c*img_chn_size + y*2*img_dim + x*2+1]);
+                            res = sycl::max(res, in_d[c*img_chn_size + ((y*2)+1)*img_dim + x*2]);
+                            res = sycl::max(res, in_d[c*img_chn_size + ((y*2)+1)*img_dim + (x*2) + 1]);
+                            result_d[c1_pad_chn_size*c + (y+1)*c1_pad_dim + x+1] = res;
                         }
                     }
                 }
             });
         });
 
+        q.wait();
+        q.submit([&] (handler &h) {
+            memcpy(pooled1.data(), pooled1_ptr, c1_chn*c1_pad_dim*c1_pad_dim*sizeof(int8_t));
+        }).wait();
+        peek_int(c1_pad_dim, c1_pad_dim, &pooled1[0], true);
+
         /*
             Convolute image with 3x3xc2_chn filter and zero-padding, quantise and ReLU output features
         */
-        auto c2_corner_event = q.submit([&](handler &h)
+        auto c2_event = q.submit([&](handler &h)
         {
             h.depends_on(pool1_event);
             h.depends_on(filter2_to_device_event);
@@ -209,12 +219,19 @@ int main()
                 Conv<c1_chn,c1_pad_dim,c2_chn,filter_size>(pooled1_ptr, conv2_f_ptr, conv2_b_ptr, c2_scale, conved2_ptr);
             });
         });
+        q.wait();
+        q.submit([&] (handler &h) {
+            h.memcpy(conved2.data(), conved2_ptr, c2_chn*c1_dim*c1_dim*sizeof(int8_t));
+        }).wait();
+        // peek_int(3, 3, &weights2[0], true);
+        // cout << biases2[0] << std::endl;
+        peek_int(c1_dim, c1_dim, &conved2[0], true);
 
         /*
             Max Pooling with stride 2 on feature map
         */
         auto pool2_event = q.submit([&](handler &h) {
-            h.depends_on(c2_corner_event);
+            h.depends_on(c2_event);
             
             h.single_task<class Maxpool2>([=]() [[intel::kernel_args_restrict]]{
                 MaxPool<c2_chn, c1_dim>(conved2_ptr, pooled2_ptr);
@@ -258,18 +275,16 @@ int main()
                     for (int i = 0; i < c2_chn; i++){
                         cur_proto[i] = proto_d[p*c2_chn + i];
                     }
-
                     for (int y = 0; y < c2_dim; y++){
                         for (int x = 0; x < c2_dim; x++){
                             const int _y = y*c2_dim + x;
                             float res = 0.0f;
-                            #pragma unroll 16
+                            #pragma unroll 2
                             [[intel::ivdep]]
                             for (int c = 0; c < c2_chn; c++){
                                 float dist = in_d[c*c2_chn_size + _y] - cur_proto[c];
                                 res += dist*dist;
                             }
-                            res = sycl::sqrt(res);
                             res_d[p*c2_dim*c2_dim + y*c2_dim + x] = sycl::log((res+1)/(res+0.0001f));
                         }
                     }
@@ -432,34 +447,32 @@ int main()
                     for (int i = 0; i < num_protos; i++) {
                         sum += in_d[i] * w_d[index * num_protos + i];
                     }
-                    result_d[index] = sum * 0.01979798823595047*0.009601877070963383;
+                    result_d[index] = round(sum * 0.01979798823595047*0.009601877070963383);
                 }
             });
         });
 
+        cout << "Jobs submitted \n";
         // Wait for final kenels to finish execution
         fc_event.wait();
         upsample1_event.wait();
         upsample2_event.wait();
         upsample3_event.wait();
         upsample4_event.wait();
-        
-        auto stop = high_resolution_clock::now();
-        times[i] = duration_cast<microseconds>(stop - start).count();
 
-        print_exec_time(quant_event, "Quant");
-        print_exec_time(c1_corner_event, "C1 Corner");
-        print_exec_time(pool1_event, "Pool1");
-        print_exec_time(c2_corner_event, "C2 Corner");
-        print_exec_time(pool2_event, "Pool2");
-        print_exec_time(dequant_event, "Dequant");
-        print_exec_time(similarity_event, "Similarity");
-        print_exec_time(upsample1_event, "Upsample 1");
-        print_exec_time(upsample2_event, "Upsample 2");
-        print_exec_time(upsample3_event, "Upsample 3");
-        print_exec_time(upsample4_event, "Upsample 4");
-        print_exec_time(sim_score_event, "Sim Score");
-        print_exec_time(fc_event, "FC Event");
+        times[i] += print_exec_time(quant_event, "Quant");
+        times[i] += print_exec_time(c1_event, "Conv1");
+        times[i] += print_exec_time(pool1_event, "Pool1");
+        times[i] += print_exec_time(c2_event, "Conv2");
+        times[i] += print_exec_time(pool2_event, "Pool2");
+        times[i] += print_exec_time(dequant_event, "Dequant");
+        times[i] += print_exec_time(similarity_event, "Similarity");
+        times[i] += print_exec_time(upsample1_event, "Upsample 1");
+        times[i] += print_exec_time(upsample2_event, "Upsample 2");
+        times[i] += print_exec_time(upsample3_event, "Upsample 3");
+        times[i] += print_exec_time(upsample4_event, "Upsample 4");
+        times[i] += print_exec_time(sim_score_event, "Sim Score");
+        times[i] += print_exec_time(fc_event, "FC Event");
     }
 
     auto logits_to_host = q.submit([&] (handler &h) {
@@ -492,7 +505,7 @@ int main()
     //Print out the output.
     peek(1, 3, &logits[0], true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
     // // peek(1, 15, avg_f, false);
-    peek(224, 224, &upsample[0], true);
+    // peek(224, 224, &upsample[0], true);
     // peek(224, 224, upsampled_f + 224 * 224, true);
     // peek(224, 224, upsampled_f + 14 * 224 * 224, true);
 

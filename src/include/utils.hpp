@@ -16,7 +16,7 @@ void exception_handler(sycl::exception_list exceptions) {
   }
 }
 
-void print_exec_time(event e, string name){
+double print_exec_time(event e, string name){
     auto start_time = e.template
             get_profiling_info<sycl::info::event_profiling::command_start>();
     auto end_time = e.template
@@ -24,6 +24,8 @@ void print_exec_time(event e, string name){
     double dur = (end_time - start_time) / 1.0e9;
 
     cout <<  name << " event time: " << dur << std::endl;
+    
+    return dur;
 }
 /* Show the matrix. If snapshot = true, only shwo the first 5 * 5 corner. */
 void peek(int row, int col, float *matrix, bool snapshot)
