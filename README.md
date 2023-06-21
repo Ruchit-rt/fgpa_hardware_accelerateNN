@@ -1,4 +1,4 @@
-# `Accelerate Interpretable Deep Neural Networks for Medical Imaging`
+# `Accelerate Interpretable Deep Neural Networks`
 
 project description.
 
