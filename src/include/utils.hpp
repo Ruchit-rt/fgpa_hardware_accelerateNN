@@ -73,11 +73,11 @@ void peek_int(int row, int col, int8_t *matrix, bool snapshot)
 }
 
 
-std::vector<int> findTopIndices(const  array) {
-    std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<std::pair<int, int>>> minHeap;
+std::vector<int> findTopIndices(const std::vector<float> array) {
+    std::priority_queue<std::pair<float, int>, std::vector<std::pair<int, int>>, std::greater<std::pair<int, int>>> minHeap;
 
     for (int i = 0; i < array.size(); i++) {
-        if (minHeap.size() < 9) {
+        if (minHeap.size() < 2508) { //top 5%
             minHeap.push(std::make_pair(array[i], i));
         } else if (array[i] > minHeap.top().first) {
             minHeap.pop();
