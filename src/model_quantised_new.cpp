@@ -21,7 +21,7 @@ using namespace std;
 using namespace sycl;
 
 // Number of iterations.
-#define N 1
+#define N 5
 
 int main()
 {
@@ -39,7 +39,7 @@ int main()
 
     // Enable the queue profiling to time the execution
     property_list queue_properties{sycl::property::queue::enable_profiling()};
-    queue q = sycl::queue(selector, exception_handler, queue_properties);
+    sycl::queue q = sycl::queue(selector, exception_handler, queue_properties);
 
     auto device = q.get_device();
 
@@ -60,7 +60,7 @@ int main()
               << std::endl;
 
     // The file that encodes all parameters of the model.
-    ifstream rf_data("/home/u178815/final-year-project/data/model_params_quant.mmzk", ios::binary);
+    ifstream rf_data("/home/u196631/urop/final-year-project/data/model_params_quant.mmzk", ios::binary);
     if (!rf_data.is_open())
     {
         cout << "Cannot open file!" << std::endl;
@@ -125,12 +125,40 @@ int main()
     // Timings.
     double times[N] = {};
 
+
+    /* reading input from file ----- */ 
+    std::ifstream inputFile("src/input.txt");
+    std::vector<float> values;
+    std::string line, value;
+  
+    if (inputFile.is_open()) {
+            while (std::getline(inputFile, line)) {
+                    std::istringstream iss(line);
+                    while (std::getline(iss, value, ',')) {
+                    float floatValue = std::stof(value);
+                    values.push_back(floatValue);
+            }
+    }
+    inputFile.close();
+    cout << "Input.txt was read" << std::endl;
+
+    // Convert vector to float array
+    float* input_ff = new float[values.size()];
+    std::copy(values.begin(), values.end(), input_ff);
+
+    cout << "input_ff has been initialised" << std::endl;
+    
+    /* input from file stored in input_ff ----- */ 
+
     for (int i = 0; i < N; i++)
     {
+
         auto start = high_resolution_clock::now();
 
         //Copy input image into device (TODO: stream from host instead)
-        auto img_to_device_event = q.memcpy(img_f_ptr, &input_f[0], img_size * sizeof(float));
+        auto img_to_device_event = q.memcpy(img_f_ptr, input_ff, img_size * sizeof(float));
+        cout << "input_ff memcpy completed" << std::endl;
+
         /*
             Quantise the image
         */
@@ -258,6 +286,7 @@ int main()
             });
         });
 
+
         /*
             Calculate similarity between feature map values and prototypes
         */
@@ -350,6 +379,7 @@ int main()
             });
         });
 
+        // segfault happening here
         auto upsample4_event = q.submit([&](handler &h) {
             h.single_task<class Upsample4>([=] () [[intel::kernel_args_restrict]]{
                 device_ptr<float> tensor_d(sims_ptr);
@@ -364,6 +394,7 @@ int main()
                             result_d[(c * c2_dim * c2_dim) + (y + 2) * c2_dim + x + 2]
                                 = (tensor_d[(c * c2_dim * c2_dim) + _q1 * c2_dim +_q2] * (8 - _r1) + tensor_d[(c * c2_dim * c2_dim) + (_q1 + 1) * c2_dim + _q2] * _r1) * (8 - _r2) / 64
                                 + (tensor_d[(c * c2_dim * c2_dim) + _q1 * c2_dim + _q2 + 1] * (8 - _r1) + tensor_d[(c * c2_dim * c2_dim) + (_q1 + 1) * c2_dim + _q2 + 1] * _r1) * _r2 / 64;
+                            cout << "LOL4" << std::endl;
                         }
                     }
                 }
@@ -447,6 +478,8 @@ int main()
             });
         });
 
+        
+
         // Wait for final kenels to finish execution
         fc_event.wait();
         upsample1_event.wait();
@@ -456,6 +489,7 @@ int main()
         
         auto stop = high_resolution_clock::now();
         times[i] = duration_cast<microseconds>(stop - start).count();
+        cout << "iteration completed" << std::endl;
 
         print_exec_time(quant_event, "Quant");
         print_exec_time(c1_corner_event, "C1 Corner");
@@ -529,6 +563,12 @@ int main()
     delete[] biases2;
     delete[] prototypes;
     delete[] fc_weights;
+    delete[] input_ff;
 
     return 0;
+    }
+    else {
+        std::cout << "Failed to open the input file." << std::endl;
+        std::terminate();
+    }
 }

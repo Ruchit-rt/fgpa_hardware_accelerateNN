@@ -1,0 +1,42 @@
+
+########################################################################
+#      Date:           Sat 22 Jul 2023 09:52:28 PM PDT
+#    Job ID:           2347073.v-qsvr-1.aidevcloud
+#      User:           u196631
+# Resources:           cput=75:00:00,neednodes=1:fpga_compile:ppn=2,nodes=1:fpga_compile:ppn=2,walltime=23:00:00
+########################################################################
+
+aoc: Warning RAM Utilization is at 131%!
+aoc: Compiling for FPGA. This process may take several hours to complete.  Prior to performing this compile, be sure to check the reports to ensure the design will meet your performance targets.  If the reports indicate performance targets are not being met, code edits may be required.  Please refer to the oneAPI FPGA Optimization Guide for information on performance tuning applications for FPGAs.
+Info: *******************************************************************
+Info: Running Quartus Prime Shell
+    Info: Version 19.2.0 Build 57 06/24/2019 Patches 0.05dcp SJ Pro Edition
+    Info: Copyright (C) 2019  Intel Corporation. All rights reserved.
+    Info: Your use of Intel Corporation's design tools, logic functions 
+    Info: and other software and tools, and any partner logic 
+    Info: functions, and any output files from any of the foregoing 
+    Info: (including device programming or simulation files), and any 
+    Info: associated documentation or information are expressly subject 
+    Info: to the terms and conditions of the Intel Program License 
+    Info: Subscription Agreement, the Intel Quartus Prime License Agreement,
+    Info: the Intel FPGA IP License Agreement, or other applicable license
+    Info: agreement, including, without limitation, that your use is for
+    Info: the sole purpose of programming logic devices manufactured by
+    Info: Intel and sold by Intel or its authorized distributors.  Please
+    Info: refer to the applicable agreement for further details, at
+    Info: https://fpgasoftware.intel.com/eula.
+    Info: Processing started: Sat Jul 22 21:56:01 2023
+Info: Command: quartus_sh -t build/entry.tcl import
+Info: Quartus(args): import
+Error (23018): Tcl Script File build/entry.tcl not found
+Error (23031): Evaluation of Tcl script build/entry.tcl unsuccessful
+Error: Quartus Prime Shell was unsuccessful. 2 errors, 0 warnings
+    Error: Peak virtual memory: 982 megabytes
+    Error: Processing ended: Sat Jul 22 21:56:01 2023
+    Error: Elapsed time: 00:00:00
+
+########################################################################
+# End of output for job 2347073.v-qsvr-1.aidevcloud
+# Date: Sat 22 Jul 2023 09:56:22 PM PDT
+########################################################################
+

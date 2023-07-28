@@ -39,7 +39,7 @@ int main()
 
     // Enable the queue profiling to time the execution
     property_list queue_properties{sycl::property::queue::enable_profiling()};
-    queue q = sycl::queue(selector, exception_handler, queue_properties);
+    sycl::queue q = sycl::queue(selector, exception_handler, queue_properties);
 
     auto device = q.get_device();
 
@@ -120,14 +120,6 @@ int main()
         class SimMapToScorePipeID,
         std::array<int8_t,c2_chn_size>,
         num_protos>;
-    
-    
-    
-    
-    
-    
-    
-
 
     cout << "Init outputs" << std::endl;
 
@@ -135,7 +127,7 @@ int main()
     Allocate memory and copy onto device for the network parameters and layers 
     */
     float* img_f_ptr = malloc_shared<float>(img_size, q);
-    // int8_t* img_ptr = (int8_t*) malloc_device(img_pad_size * sizeof(int8_t), q);
+    int8_t* img_ptr = (int8_t*) malloc_device(img_pad_size * sizeof(int8_t), q);
     // for (int i = 0; i < img_pad_size; i++) img_ptr[i] = 0;
     
     int8_t* conv1_f_ptr = (int8_t*) malloc_device(c1_chn * img_chn * filter_size * sizeof(int8_t), q);

@@ -4,7 +4,8 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/home/u178815/intel/oneapi/compiler/2021.1.1/linux/include/sycl"
+                "/home/u178815/intel/oneapi/compiler/2021.1.1/linux/include/sycl",
+                "/home/u196631/urop/final-year-project/src/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",

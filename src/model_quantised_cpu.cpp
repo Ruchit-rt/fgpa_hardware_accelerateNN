@@ -24,7 +24,7 @@ using namespace sycl;
 #define N 1
 
 /* Carry out MaxPool on the given TENSOR (C * H * W) with a stride of 2. */
-void max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor, int8_t *result) {
+void max_pool_q(sycl::queue &q, int chn, int row, int col, int8_t *tensor, int8_t *result) {
   const int stride = 2;
   const int nr = 1 + (row - 1) / stride;
   const int nc = 1 + (col - 1) / stride;
@@ -59,7 +59,7 @@ void max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor, int8_t *res
 }
 
 // Quantise the input TENSOR with the given SCALE.
-void quant(queue &q, int size, float scale, float *tensor, int8_t *result) {
+void quant(sycl::queue &q, int size, float scale, float *tensor, int8_t *result) {
   buffer t_buf(tensor, range(size));
   buffer r_buf(result, range(size));
   q.submit([&](auto &h) {
@@ -75,7 +75,7 @@ void quant(queue &q, int size, float scale, float *tensor, int8_t *result) {
 }
 
 // Dequantise the input TENSOR with the given SCALE.
-void dequant(queue &q, int size, float scale, int8_t *tensor, float *result) {
+void dequant(sycl::queue &q, int size, float scale, int8_t *tensor, float *result) {
   buffer t_buf(tensor, range(size));
   buffer r_buf(result, range(size));
   q.submit([&](auto &h) {
@@ -263,7 +263,7 @@ void dequant(queue &q, int size, float scale, int8_t *tensor, float *result) {
 // }
 
 /* Carry out the calculation for a fully-connected layer. */
-void fully_connected(queue &q, int c_in, int c_out, int8_t *vector,
+void fully_connected(sycl::queue &q, int c_in, int c_out, int8_t *vector,
     int8_t *weights, int8_t *result) {
   {
     buffer v_buf(vector, range(c_in));
@@ -293,7 +293,7 @@ void fully_connected(queue &q, int c_in, int c_out, int8_t *vector,
 }
 
 /* The L2-distance computation, used for the prototype layer. */
-void l2_distance(queue &q, int chn, int length, float *tensor, int d, float *prototypes, float *result) {
+void l2_distance(sycl::queue &q, int chn, int length, float *tensor, int d, float *prototypes, float *result) {
   {
     buffer m_buf(tensor, range(chn, length));
     buffer p_buf(prototypes, range(d, chn));
@@ -319,7 +319,7 @@ void l2_distance(queue &q, int chn, int length, float *tensor, int d, float *pro
 }
 
 /* Convert distances to similarity map (part of the prototype layer). */
-void distance_2_similarity(queue &q, int length, float *vector, float *result) {
+void distance_2_similarity(sycl::queue &q, int length, float *vector, float *result) {
   {
     buffer v_buf(vector, range(length));
     buffer r_buf(result, range(length));
@@ -337,7 +337,7 @@ void distance_2_similarity(queue &q, int length, float *vector, float *result) {
 }
 
 /* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
-void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *result, bool is_top) {
+void top9_average_pooling(sycl::queue &q, int chn, int length, float *tensor, float *result, bool is_top) {
   {
     buffer m_buf(tensor, range(chn, length));
     buffer r_buf(result, range(chn));
@@ -394,7 +394,7 @@ void top9_average_pooling(queue &q, int chn, int length, float *tensor, float *r
 }
 
 /* Upsample the TENSOR by a factor of 2 using Linear 2D without aligning the corners. */
-void upsample4(queue &q, int chn, int row, int col, float *tensor, float *result) {
+void upsample4(sycl::queue &q, int chn, int row, int col, float *tensor, float *result) {
   {
     buffer m_buf(tensor, range(chn, row, col));
     buffer r_buf(result, range(chn, row * 4, col * 4));
@@ -491,7 +491,7 @@ int main() {
     auto selector = sycl::ext::intel::fpga_emulator_selector_v;
     #endif
     property_list queue_properties{sycl::property::queue::enable_profiling()};
-    queue q = sycl::queue(selector, queue_properties);
+    sycl::queue q = sycl::queue(selector, queue_properties);
 
     auto device = q.get_device();
 

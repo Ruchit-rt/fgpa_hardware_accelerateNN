@@ -19,8 +19,8 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 ###############################################################################
 ### Customize these build variables
 ###############################################################################
-set(SOURCE_FILES src/model_quantised_conv.cpp)
-set(TARGET_NAME model_quantised_conv)
+set(SOURCE_FILES src/model_quantised.cpp)
+set(TARGET_NAME model_quantised)
 
 # Use cmake -DFPGA_DEVICE=<board-support-package>:<board-variant> to choose a
 # different device. Here are a few device examples (this list is not

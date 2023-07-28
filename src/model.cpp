@@ -6,6 +6,8 @@
 #include "dpc_common.hpp"
 #include <oneapi/dpl/random>
 #include <oneapi/mkl.hpp>
+#include <sstream>
+#include <vector>
 
 #if FPGA || FPGA_EMULATOR
 #include <sycl/ext/intel/fpga_extensions.hpp>
@@ -16,7 +18,7 @@ using namespace std;
 using namespace sycl;
 
 #define N 50
-
+/*
 float input[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.5451, 0.5569,
         0.5490, 0.5765, 0.5922, 0.5725, 0.5686, 0.5686, 0.5451, 0.5451, 0.5333,
         0.5216, 0.5098, 0.5020, 0.5059, 0.5294, 0.5529, 0.5569, 0.5490, 0.5412,
@@ -16742,7 +16744,7 @@ float input[] = {0.5373, 0.5451, 0.5843, 0.6000, 0.5608, 0.5412, 0.5490, 0.5451,
         0.1255, 0.0941, 0.0431, 0.0510, 0.0745, 0.0980, 0.1255, 0.1059, 0.0667,
         0.0510, 0.0549, 0.0275, 0.0078, 0.0235, 0.0431, 0.0863, 0.1059, 0.0824,
         0.0588, 0.0667, 0.0863, 0.0980, 0.1137, 0.1294, 0.1451, 0.1608, 0.1451,
-        0.0824, 0.0235, 0.0078};
+        0.0824, 0.0235, 0.0078}; */
 
 /* Make a matrix of the given size and initialise all values to x. */
 void mk_mat(queue &q, int row, int col, float x, float *result) {
@@ -16880,7 +16882,6 @@ void conv(queue &q, int batch, int chn, int row, int col, float *tensor,
    size must be an odd number and less than min(row, col). */
 void conv_pad(queue &q, int batch, int chn, int row, int col, float *tensor,
     int d, int size, float *filter, float *biases, float *result) {
-  {
     buffer m_buf(tensor, range(batch * chn, row, col));
     buffer f_buf(filter, range(d * chn, size, size));
     buffer b_buf(biases, range(d));
@@ -16907,13 +16908,11 @@ void conv_pad(queue &q, int batch, int chn, int row, int col, float *tensor,
         r[index] = sum + b[_d];
       });
     });
-  }
 }
 
 /* Carry out the calculation for a fully-connected layer. */
 void fully_connected(queue &q, int c_in, int c_out, float *vector,
     float *weights, float *bias, float *result) {
-  {
     buffer v_buf(vector, range(c_in));
     buffer w_buf(weights, range(c_out, c_in));
     buffer b_buf(bias, range(c_out));
@@ -16932,11 +16931,9 @@ void fully_connected(queue &q, int c_in, int c_out, float *vector,
         r[index] = sum + b[index];
       });
     });
-  }
 }
 
 void l2_distance(queue &q, int chn, int length, float *matrices, int d, float *prototypes, float *result) {
-  {
     buffer m_buf(matrices, range(chn, length));
     buffer p_buf(prototypes, range(d, chn));
     buffer r_buf(result, range(d, length));
@@ -16953,11 +16950,9 @@ void l2_distance(queue &q, int chn, int length, float *matrices, int d, float *p
         r[index] = sqrt(sum);
       });
     });
-  }
 }
 
 void distance_2_similarity(queue &q, int length, float *vector, float *result) {
-  {
     buffer v_buf(vector, range(length));
     buffer r_buf(result, range(length));
     q.submit([&](auto &h) {
@@ -16968,11 +16963,9 @@ void distance_2_similarity(queue &q, int length, float *vector, float *result) {
         r[index] = log((v[index] + 1) / (v[index] + 0.0001));
       });
     });
-  }
 }
 
 void top9(queue &q, int chn, int length, float *tensor, float *result) {
-  {
     buffer m_buf(tensor, range(chn, length));
     buffer r_buf(result, range(chn, 9));
     q.submit([&](auto &h) {
@@ -17018,11 +17011,9 @@ void top9(queue &q, int chn, int length, float *tensor, float *result) {
         }
       });
     });
-  }
 }
 
 void bottom9(queue &q, int chn, int length, float *tensor, float *result) {
-  {
     buffer m_buf(tensor, range(chn, length));
     buffer r_buf(result, range(chn, 9));
     q.submit([&](auto &h) {
@@ -17068,11 +17059,10 @@ void bottom9(queue &q, int chn, int length, float *tensor, float *result) {
         }
       });
     });
-  }
 }
 
-void average(queue &q, int chn, int length, float *tensor, float *result) {
-  {
+void average(queue &q, int chn, int length, float *tensor, float *result) 
+{
     buffer m_buf(tensor, range(chn, length));
     buffer r_buf(result, range(chn));
 
@@ -17088,11 +17078,10 @@ void average(queue &q, int chn, int length, float *tensor, float *result) {
         r[index] = sum / length;
       });
     });
-  }
 }
 
-void upsample4(queue &q, int chn, int row, int col, float *matrix, float *result) {
-  {
+void upsample4(queue &q, int chn, int row, int col, float *matrix, float *result) 
+{
     buffer m_buf(matrix, range(chn, row, col));
     buffer r_buf(result, range(chn, row * 4, col * 4));
 
@@ -17156,7 +17145,6 @@ void upsample4(queue &q, int chn, int row, int col, float *matrix, float *result
             + (m[index[0]][_q1][_q2 + 1] * (8 - _r1) + m[index[0]][_q1 + 1][_q2 + 1] * _r1) * _r2 / 64;
       });
     });
-  }
 }
 
 float *read_param(ifstream &rf) {
@@ -17176,6 +17164,28 @@ int main() {
     cout << "Cannot open file!" << std::endl;
     return 1;
   }
+
+  /* reading input from file ----- */ 
+  std::ifstream inputFile("src/input.txt");
+  std::vector<float> values;
+  std::string line, value;
+  
+  if (inputFile.is_open()) {
+        while (std::getline(inputFile, line)) {
+                std::istringstream iss(line);
+                while (std::getline(iss, value, ',')) {
+                float floatValue = std::stof(value);
+                values.push_back(floatValue);
+        }
+  }
+  inputFile.close();
+
+  // Convert vector to float array
+  float* input_ff = new float[values.size()];
+  std::copy(values.begin(), values.end(), input_ff);
+  
+  /* input from file stored in input_ff ----- */ 
+
 
   float *weights1 = read_param(rf);
   float *biases1 = read_param(rf);
@@ -17197,12 +17207,12 @@ int main() {
   float *avg = new float[15];
   float *logits = new float[3];
 
-  long times[N] = {};
+  long times[N] = {};     
 
   for (int i = 0; i < N; i++) {
     auto start = high_resolution_clock::now();
 
-    conv_pad(q, 1, 3, 224, 224, input, 64, 3, weights1, biases1, conved1);
+    conv_pad(q, 1, 3, 224, 224, input_ff, 64, 3, weights1, biases1, conved1);
     relu(q, 64 * 224 * 224, conved1, conved1);
     max_pool(q, 64, 224, 224, conved1, 2, NULL, NULL, pooled1);
     conv_pad(q, 1, 64, 112, 112, pooled1, 512, 3, weights2, biases2, conved2);
@@ -17250,6 +17260,13 @@ int main() {
   delete[] top_similarities;
   delete[] fc_weights;
   delete[] logits;
+  delete[] input_ff;
 
   return 0;
+
+  }
+  else {
+   std::cout << "Failed to open the input file." << std::endl;
+   return 1;
+  }
 }

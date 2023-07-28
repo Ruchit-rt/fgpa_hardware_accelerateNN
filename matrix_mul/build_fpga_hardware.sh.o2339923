@@ -1,0 +1,17 @@
+
+########################################################################
+#      Date:           Tue 11 Jul 2023 12:08:27 AM PDT
+#    Job ID:           2339923.v-qsvr-1.aidevcloud
+#      User:           u196631
+# Resources:           cput=75:00:00,neednodes=1:fpga_compile:ppn=2,nodes=1:fpga_compile:ppn=2,walltime=06:00:00
+########################################################################
+
+icpx -fsycl -fintelfpga -DFPGA_BOARD=/opt/intel/oneapi/intel_a10gx_pac:pac_a10  -DFPGA -Xshardware src/matrix_mul_sycl.cpp -o matrix_mul_dpcpp.fpga
+aoc: Compiling for FPGA. This process may take several hours to complete.  Prior to performing this compile, be sure to check the reports to ensure the design will meet your performance targets.  If the reports indicate performance targets are not being met, code edits may be required.  Please refer to the oneAPI FPGA Optimization Guide for information on performance tuning applications for FPGAs.
+Error: The board package being used only supports report generation/emulation/runtime, please use the board package shipped in the FPGA addon instead.
+
+########################################################################
+# End of output for job 2339923.v-qsvr-1.aidevcloud
+# Date: Tue 11 Jul 2023 12:09:01 AM PDT
+########################################################################
+

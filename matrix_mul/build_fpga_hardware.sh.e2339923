@@ -1,0 +1,30 @@
+src/matrix_mul_sycl.cpp:63:17: warning: 'fpga_selector' is deprecated: Use the callable sycl::ext::intel::fpga_selector_v instead. [-Wdeprecated-declarations]
+    ext::intel::fpga_selector device_selector;
+                ^
+/glob/development-tools/versions/oneapi/2023.1.2/oneapi/compiler/2023.1.0/linux/bin-llvm/../include/sycl/ext/intel/fpga_device_selector.hpp:80:7: note: 'fpga_selector' has been explicitly marked deprecated here
+class __SYCL2020_DEPRECATED(
+      ^
+/glob/development-tools/versions/oneapi/2023.1.2/oneapi/compiler/2023.1.0/linux/bin-llvm/../include/sycl/detail/defines_elementary.hpp:48:40: note: expanded from macro '__SYCL2020_DEPRECATED'
+#define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+                                       ^
+/glob/development-tools/versions/oneapi/2023.1.2/oneapi/compiler/2023.1.0/linux/bin-llvm/../include/sycl/detail/defines_elementary.hpp:39:38: note: expanded from macro '__SYCL_DEPRECATED'
+#define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+                                     ^
+src/matrix_mul_sycl.cpp:70:11: warning: 'queue' is deprecated: SYCL 1.2.1 device selectors are deprecated. Please use SYCL 2020 device selectors instead. [-Wdeprecated-declarations]
+    queue q(device_selector, dpc_common::exception_handler);
+          ^
+/glob/development-tools/versions/oneapi/2023.1.2/oneapi/compiler/2023.1.0/linux/bin-llvm/../include/sycl/queue.hpp:182:3: note: 'queue' has been explicitly marked deprecated here
+  __SYCL2020_DEPRECATED("SYCL 1.2.1 device selectors are deprecated. Please "
+  ^
+/glob/development-tools/versions/oneapi/2023.1.2/oneapi/compiler/2023.1.0/linux/bin-llvm/../include/sycl/detail/defines_elementary.hpp:48:40: note: expanded from macro '__SYCL2020_DEPRECATED'
+#define __SYCL2020_DEPRECATED(message) __SYCL_DEPRECATED(message)
+                                       ^
+/glob/development-tools/versions/oneapi/2023.1.2/oneapi/compiler/2023.1.0/linux/bin-llvm/../include/sycl/detail/defines_elementary.hpp:39:38: note: expanded from macro '__SYCL_DEPRECATED'
+#define __SYCL_DEPRECATED(message) [[deprecated(message)]]
+                                     ^
+2 warnings generated.
+Error: Exiting.
+
+llvm-foreach: 
+icpx: error: fpga compiler command failed with exit code 1 (use -v to see invocation)
+make: *** [Makefile:21: fpga_hardware] Error 1
