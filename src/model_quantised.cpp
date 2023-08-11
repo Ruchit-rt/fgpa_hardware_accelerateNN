@@ -745,7 +745,7 @@ int main()
     cout << "Model parameters file opened successfully" << std::endl;
 
     /* reading input from file ----- */ 
-    std::ifstream inputFile("src/input.txt");
+    std::ifstream inputFile("/home/u196631/urop/final-year-project/src/input.txt");
     std::vector<float> values;
     std::string line, value;
   
@@ -789,6 +789,7 @@ int main()
         float* input_f_ptr = (float*) malloc_device(3 * 224 * 224 * sizeof(float), q);
         auto input_to_device_event = q.memcpy(input_f_ptr, input_ff, 3*224*224 * sizeof(float));
         input_to_device_event.wait();
+        
 
         // Quantise the input.
         int8_t* input_ptr = quant(q, 3 * 224 * 224, 0.01979798823595047, input_f_ptr);
@@ -815,7 +816,6 @@ int main()
         // Compute upsampled activation map (information for interpretation).
         upsample4(q, 15, 56, 56, similarities_f_ptr, upsampled_f);
         
-
         // Fully-connected layer.
         int8_t *avg_ptr = quant(q, 15, 0.01979798823595047, avg_f_ptr);
         int8_t *logits_ptr = fully_connected(q, 15, 3, avg_ptr, fc_weights);
@@ -835,9 +835,13 @@ int main()
         auto stop = high_resolution_clock::now();
         times[i] = duration_cast<microseconds>(stop - start).count();
     }
+    delete[] input_ff;
 
     // Print out the output.
-    peek(1, 3, logits_f, true); // The index corresponding to the maximum value is the index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
+    // The index corresponding to the maximum value is the 
+    // index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
+    cout << "Peeking... ";
+    peek(1, 3, logits_f, true);
     // peek(1, 15, avg_f, false);
     peek(224, 224, upsampled_f, true);
     peek(224, 224, upsampled_f + 224 * 224, true);
@@ -862,7 +866,7 @@ int main()
 
     delete[] logits_f;
     delete[] upsampled_f;
-    delete[] input_ff;
+    // delete[] input_ff;
 
     return 0;
     }
