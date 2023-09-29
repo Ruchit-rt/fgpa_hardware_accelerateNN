@@ -1,6 +1,18 @@
 # `Accelerate Interpretable Deep Neural Networks`
 
-project description.
+This projects attempts to accelerate the IAIA-BL code (https://github.com/Ruchit-rt/interpretable_neural_networks) using SYCL
+kernels on intel devcloud FPGA nodes. Results have been obtained via emulation due to a compilation bug on devcloud.
+
+## Understanding the Codebase
+
+The *scripts* directory shows examples of how the code can be compiled, emulated etc. The main source code can be found
+under the *src* directory. The file to look at should be src/model_unoptimised.cpp to understand hpw the kernels implement
+the different layers. 
+
+The test directory contains numpy arrays under 3 classes used for testing the data.
+
+OpenCV dependency needs to be built for running the code. 
+
 
 ## Setting Optional Flags
 
