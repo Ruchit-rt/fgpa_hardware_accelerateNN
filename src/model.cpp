@@ -17215,6 +17215,7 @@ int main() {
     conv_pad(q, 1, 3, 224, 224, input_ff, 64, 3, weights1, biases1, conved1);
     relu(q, 64 * 224 * 224, conved1, conved1);
     max_pool(q, 64, 224, 224, conved1, 2, NULL, NULL, pooled1);
+    
     conv_pad(q, 1, 64, 112, 112, pooled1, 512, 3, weights2, biases2, conved2);
     relu(q, 512 * 112 * 112, conved2, conved2);
     max_pool(q, 512, 112, 112, conved2, 2, NULL, NULL, pooled2);

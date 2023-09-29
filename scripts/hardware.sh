@@ -8,4 +8,4 @@ export QUARTUS_ROOTDIR=/glob/development-tools/versions/intelFPGA_pro/19.2/quart
 export QSYS_ROOTDIR=/glob/development-tools/versions/intelFPGA_pro/19.2/qsys/bin
 export PATH="$QUARTUS_ROOTDIR/bin:$QSYS_ROOTDIR:$PATH"
 cd /home/u196631/urop/final-year-project/
-icpx -v -fsycl -fintelfpga -DFPGA_HARDWARE src/model_quantised.cpp -Xshardware -o tester_2Kernel_repeat.fpga -Xstarget=intel_s10sx_pac:pac_s10_usm $(pkg-config --cflags --libs opencv4)
+icpx -v -fsycl -fintelfpga -DFPGA_HARDWARE src/tester.cpp -Xshardware -o tester_3kernel_noUSMcheck.fpga -Xstarget=intel_s10sx_pac:pac_s10_usm $(pkg-config --cflags --libs opencv4)

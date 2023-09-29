@@ -116,7 +116,7 @@ int8_t* max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor_ptr)
         });
     });
     pool_event.wait();
-    print_exec_time(pool_event, "Pool");
+    // print_exec_time(pool_event, "Pool");
     free(tensor_ptr, q);
 
     return result_ptr;
@@ -125,6 +125,7 @@ int8_t* max_pool_q(queue &q, int chn, int row, int col, int8_t *tensor_ptr)
 // Quantise the input TENSOR with the given SCALE.
 int8_t* quant(queue &q, int size, float scale, float *tensor_ptr)
 {
+    // update scaling factor, 
     int8_t* result_ptr = (int8_t*) malloc_device(size * sizeof(int8_t), q);
 
     auto quant_event = q.submit([&](handler &h) {
@@ -138,11 +139,24 @@ int8_t* quant(queue &q, int size, float scale, float *tensor_ptr)
         });
      });
 
-     quant_event.wait();
-     print_exec_time(quant_event, "Quant");
-     free(tensor_ptr, q);
+    // cout << "Quanting " << static_cast<int8_t>(result_ptr[0]) << " " << static_cast<int8_t>(result_ptr[1]) << std::endl;
 
-     return result_ptr;
+     quant_event.wait();
+    //  print_exec_time(quant_event, "Quant");
+
+    free(tensor_ptr, q);    
+
+    // int32_t sum = 0.0;
+    // for (int i = 0; i < size; i++){
+    //     sum += result_ptr[i];
+    // } 
+    // // cout << "Quant Rsultptr: " << static_cast<int32_t>(result_ptr[0])
+    // // << " " << static_cast<int32_t>(result_ptr[1])
+    // // << " "<< static_cast<int32_t>(result_ptr[2])
+    // // << " " << std::endl;
+    // cout << "Sum after Quant: " << sum << std::endl;
+    
+    return result_ptr;
 }
 
 // Dequantise the input TENSOR with the given SCALE.
@@ -161,7 +175,7 @@ float* dequant(queue &q, int size, float scale, int8_t *tensor_ptr)
         });
     });
     dequant_event.wait();
-    print_exec_time(dequant_event, "Dequant");
+    // print_exec_time(dequant_event, "Dequant");
     free(tensor_ptr, q);
 
     return result_ptr;
@@ -362,6 +376,11 @@ int8_t* conv_pad_q(queue &q, int8_t *tensor_ptr, int8_t *filter, int32_t *biases
     free(filter_ptr, q);
     free(bias_ptr, q);
 
+    // cout << "Rsultptr: " << static_cast<int8_t>(result_ptr[0]) 
+    // << " " << static_cast<int8_t>(result_ptr[1]) 
+    // << " "<< static_cast<int8_t>(result_ptr[2]) 
+    // << " " << std::endl;
+
     return result_ptr;
 }
 
@@ -398,7 +417,7 @@ int8_t* fully_connected(queue &q, int c_in, int c_out, int8_t *tensor_ptr,
     });
 
     fc_event.wait();
-    print_exec_time(fc_event, "FC");
+    // print_exec_time(fc_event, "FC");
 
     free(weights_ptr, q);
     free(tensor_ptr, q);
@@ -435,7 +454,7 @@ float* l2_distance(queue &q, int chn, int length, float *tensor_ptr, int p_len, 
     });
 
     dist_event.wait();
-    print_exec_time(dist_event, "Distance");
+    // print_exec_time(dist_event, "Distance");
     free(tensor_ptr, q);
     free(proto_ptr, q);
 
@@ -457,70 +476,244 @@ float* distance_2_similarity(queue &q, int length, float *tensor_ptr)
         });
     });
     sim_event.wait();
-    print_exec_time(sim_event, "Dist 2 Sim");
+    // print_exec_time(sim_event, "Dist 2 Sim");
+    // cout << "Similarities: ";
+    // float max = 0.0;
+    // for (int i = 0; i < length; i++){
+    //     if (result_ptr[i] > max) {
+    //         max = result_ptr[i];
+    //     }
+    // }
+    // cout << max << " ";
+    // cout << std::endl;
+
     free(tensor_ptr, q);
 
     return result_ptr;
 }
 
+// /* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
+// float* top9_average_pooling(queue &q, int chn, int length, float *tensor_ptr)
+// {
+//     float* result_ptr = (float*) malloc_device(chn * sizeof(float), q);
+//     auto top9_event = q.submit([&](handler &h) {
+//     // The implementation uses a max-heap to keep track of the 9 largest elements.
+//         h.single_task<class Top9>([=] () [[intel::kernel_args_restrict]]{
+//             device_ptr<float> tensor_d(tensor_ptr);
+//             device_ptr<float> result_d(result_ptr);
+
+//             for (int index = 0; index < chn; index++){
+//                 float r_[9];
+
+//                 // set up max heap using called r_ for each channel
+//                 for (int i = 0; i < 9; i++) {
+//                     r_[i] = tensor_d[index * length + i];
+//                     int k = i;
+//                     while (true) {
+//                         if ((r_[k] >= r_[k / 2]) ) break;
+//                         float temp = r_[k];
+//                         r_[k] = r_[k / 2];
+//                         r_[k / 2] = temp;
+//                         k /= 2;
+//                     }
+//                 }
+
+//                 for (int i = 9; i < length; i++) {
+//                     // if tensor_d[index * length + i] is more than max in the heap
+//                     // make it max and insert r_[0] 
+//                     if (tensor_d[index * length + i] > r_[0]) {
+//                         r_[0] = tensor_d[index * length + i];
+//                         int k = 0;
+//                         while (k < 9) {
+//                             if (k >= 4) break;
+
+//                             // fix the heap
+//                             if (r_[k] > r_[2 * k + 1] || r_[k] > r_[2 * k + 2]) {
+//                                 float temp = r_[k];
+//                                 if (r_[2 * k + 1] < r_[2 * k + 2]) {
+//                                     r_[k] = r_[2 * k + 1];
+//                                     r_[2 * k + 1] = temp;
+//                                     k = 2 * k + 1;
+//                                 } else {
+//                                     r_[k] = r_[2 * k + 2];
+//                                     r_[2 * k + 2] = temp;
+//                                     k = 2 * k + 2;
+//                                 }
+//                             } else {
+//                                 break;
+//                             }
+//                         }
+//                     }
+//                 }
+
+//                 result_d[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+//             }
+//         });
+//     });
+//     top9_event.wait();
+//     // print_exec_time(top9_event, "Top 9");
+//     for (int i = 0; i < chn; i++){
+//         cout << result_ptr[i] << " ";
+//     }
+//     cout << std::endl;
+
+//     return result_ptr;
+// }
+
+
+// /* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
+// float* top9_average_pooling(queue &q, int chn, int length, float *tensor_ptr)
+// {
+//     float* result_ptr = (float*) malloc_device(chn * sizeof(float), q);
+//     float* temp_arr = (float*) malloc_device(9 * sizeof(float), q);
+//     auto top9_event = q.submit([&](handler &h) {
+//     // The implementation uses a min-heap to keep track of the 9 largest elements.
+//         h.single_task<class Top9>([=] () [[intel::kernel_args_restrict]]{
+//             device_ptr<float> tensor_d(tensor_ptr);
+//             device_ptr<float> result_d(result_ptr);
+//             device_ptr<float> temp_buffer(temp_arr);
+
+//             for (int index = 0; index < chn; index++){
+//                 float r_[9];
+
+//                 // set up min heap using called r_ for each channel
+//                 for (int i = 0; i < 9; i++) {
+//                     r_[i] = tensor_d[index * length + i];
+//                     int k = i;
+//                     while (k > 0) {
+//                         int child = (k-1) / 2;
+//                         if ((r_[k] < r_[child]) ) break;
+//                         float temp = r_[k];
+//                         r_[k] = r_[child];
+//                         r_[child] = temp;
+//                         k = child;
+//                     }
+//                 }
+
+//                 for (int i = 9; i < length; i++) {
+//                     // if tensor_d[index * length + i] is more than min in the heap
+//                     // insertion needs to happen and then bubble down
+//                     if (tensor_d[index * length + i] > r_[0]) {
+//                         bool match = false;
+//                         for (int j = 0; j < 9; j++) {
+//                             if (abs(r_[j] - tensor_d[index * length + i]) < 1e-3) {
+//                                 match = true;
+//                                 break;
+//                             }
+//                         }
+//                         if (match) {
+//                             continue;
+//                         }
+
+//                         r_[0] = tensor_d[index * length + i];
+//                         int k = 0;
+//                         while (k < 4) {
+//                             int left = 2 * k + 1;
+//                             int right = 2 * k + 2;      
+//                             float temp = r_[k];
+
+//                             if (r_[left] <= r_[right]) {
+//                                 if (r_[left] < temp) {
+//                                     r_[k] = r_[left];
+//                                     r_[left] = temp;
+//                                     k = left;
+//                                 } else {
+//                                     break;
+//                                 }
+//                             } else {
+//                                 if (r_[right] < temp) {
+//                                     r_[k] = r_[right];
+//                                     r_[right] = temp;
+//                                     k = right;
+//                                 } else {
+//                                     break;
+//                                 }
+//                             }
+//                             if (index == 1 && i == 20*55) {
+//                             for (int j = 0; j < 9; j++) {
+//                                 temp_arr[j] = r_[j];
+//                             }
+//                 }
+//                         }
+//                     }
+                   
+//                 }
+
+//                 result_d[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
+//             }
+//         });
+//     });
+//     top9_event.wait();
+//     // print_exec_time(top9_event, "Top 9");
+//     cout << "Top 9 R init: ";
+//     for (int i = 0; i < 9; i++){
+//         cout << temp_arr[i] << " ";
+//     }
+//     cout << std::endl;
+//     free(temp_arr, q);
+
+//     return result_ptr;
+// }
+
 /* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
 float* top9_average_pooling(queue &q, int chn, int length, float *tensor_ptr)
 {
     float* result_ptr = (float*) malloc_device(chn * sizeof(float), q);
+    float* temp_arr = (float*) malloc_device(9 * sizeof(float), q);
     auto top9_event = q.submit([&](handler &h) {
-    // The implementation uses a max-heap to keep track of the 9 largest elements.
+    // The implementation uses a min-heap to keep track of the 9 largest elements.
         h.single_task<class Top9>([=] () [[intel::kernel_args_restrict]]{
             device_ptr<float> tensor_d(tensor_ptr);
             device_ptr<float> result_d(result_ptr);
+            device_ptr<float> temp_buffer(temp_arr);
 
             for (int index = 0; index < chn; index++){
                 float r_[9];
+
+                // set up sorted list using called r_ for each channel
                 for (int i = 0; i < 9; i++) {
                     r_[i] = tensor_d[index * length + i];
-                    int k = i;
-                    while (true) {
-                        if ((r_[k] >= r_[k / 2]) ) break;
-                        float temp = r_[k];
-                        r_[k] = r_[k / 2];
-                        r_[k / 2] = temp;
-                        k /= 2;
-                    }
                 }
 
                 for (int i = 9; i < length; i++) {
-                    if (tensor_d[index * length + i] > r_[0]) {
-                        r_[0] = tensor_d[index * length + i];
-                        int k = 0;
-                        while (k < 9) {
-                            if (k >= 4) break;
-
-                            if (r_[k] > r_[2 * k + 1] || r_[k] > r_[2 * k + 2]) {
-                                float temp = r_[k];
-                                if (r_[2 * k + 1] < r_[2 * k + 2]) {
-                                    r_[k] = r_[2 * k + 1];
-                                    r_[2 * k + 1] = temp;
-                                    k = 2 * k + 1;
-                                } else {
-                                    r_[k] = r_[2 * k + 2];
-                                    r_[2 * k + 2] = temp;
-                                    k = 2 * k + 2;
-                                }
-                            } else {
-                                break;
+                    // if tensor_d[index * length + i] is more than min in the heap
+                    // insertion needs to happen
+                    int min_index = 0;
+                    float min_value = 10000.0;
+                    bool match = false;
+                    for (int j = 0; j < 9; j++) {
+                            if (r_[j] < min_value) {
+                                min_value = r_[j];
+                                min_index = j;
                             }
-                        }
                     }
+                    if (tensor_d[index * length + i] > min_value) r_[min_index] = tensor_d[index * length + i];
                 }
-
+                for (int u = 0; u < 9; u++) {
+                    temp_buffer[u] = r_[u];
+                }
                 result_d[index] = (r_[0] + r_[1] + r_[2] + r_[3] + r_[4] + r_[5] + r_[6] + r_[7] + r_[8]) / 9;
             }
         });
     });
     top9_event.wait();
-    print_exec_time(top9_event, "Top 9");
+    // print_exec_time(top9_event, "Top 9");
+    cout << "Top 9 result: ";
+    for (int i = 0; i < 15; i++){
+        cout << result_ptr[i] << " ";
+    }
+    cout << std::endl;
+
+    cout << "Top 9 buffer: ";
+    for (int i = 0; i < 9; i++){
+        cout << temp_arr[i] << " ";
+    }
+    cout << std::endl;
+    free(temp_arr, q);
 
     return result_ptr;
 }
+
 
 /* Pooling that takes the largest (or smallest, based on IS_TOP) 9 elements, then take the average. */
 void bottom9_average_pooling(queue &q, int chn, int length, float *tensor, float *result)
@@ -663,10 +856,10 @@ void upsample4(queue &q, int chn, int row, int col, float *tensor_ptr, float* re
         h.memcpy(&result[0], result_ptr, chn * row * col * sizeof(float) * 16);
     });
     device_to_host.wait();
-    print_exec_time(upsample1_event, "Upsample 1");
-    print_exec_time(upsample2_event, "Upsample 2");
-    print_exec_time(upsample3_event, "Upsample 3");
-    print_exec_time(upsample4_event, "Upsample 4");
+    // print_exec_time(upsample1_event, "Upsample 1");
+    // print_exec_time(upsample2_event, "Upsample 2");
+    // print_exec_time(upsample3_event, "Upsample 3");
+    // print_exec_time(upsample4_event, "Upsample 4");
     free(tensor_ptr, q);
 }
 
@@ -685,7 +878,7 @@ int8_t *read_param_int8(ifstream &rf)
 {
     int len;
     rf.read((char *)(&len), 4);
-    cout << "Reading: " << len << std::endl;
+    // cout << "Reading: " << len << std::endl;
     int8_t *result = new int8_t[len];
     rf.read((char *)result, len);
     return result;
@@ -731,10 +924,6 @@ int main()
       std::terminate();
     }
 
-    std::cout << "Running on device: "
-              << device.get_info<sycl::info::device::name>().c_str()
-              << std::endl;
-
     // The file that encodes all parameters of the model.
     ifstream rf_data("/home/u196631/urop/final-year-project/data/model_params_quant.mmzk", ios::binary);
     if (!rf_data.is_open())
@@ -742,29 +931,6 @@ int main()
         cout << "Cannot open file!" << std::endl;
         return 1;
     }
-
-    cout << "Model parameters file opened successfully" << std::endl;
-
-    /* reading input from file ----- */ 
-    std::ifstream inputFile("/home/u196631/urop/final-year-project/src/input.txt");
-    std::vector<float> values;
-    std::string line, value;
-  
-  if (inputFile.is_open()) {
-        while (std::getline(inputFile, line)) {
-                std::istringstream iss(line);
-                while (std::getline(iss, value, ',')) {
-                float floatValue = std::stof(value);
-                values.push_back(floatValue);
-        }
-  }
-  inputFile.close();
-
-  // Convert vector to float array
-  float* input_ff = new float[values.size()];
-  std::copy(values.begin(), values.end(), input_ff);
-  
-  /* input from file stored in input_ff ----- */ 
 
     // Get parameters
     int8_t *weights1 = read_param_int8(rf_data);
@@ -776,57 +942,156 @@ int main()
 
     rf_data.close();
 
-    float *logits_f = new float[3];
-    float *upsampled_f = new float[15 * 224 * 224];
+    // cout << "Model parameters file opened successfully" << std::endl;
 
-    // Timings.
-    long times[N] = {};
+    /* going through csv files from test_images_csv */
+    string cabbage_csv_path = "/home/u196631/urop/final-year-project/test_images_csv/cabbage/";
+    int cabbage_acc = 0;
+    for (int i = 0; i < 3; i++) {
+        float *logits_f = new float[3];
+        float *upsampled_f = new float[15 * 224 * 224];
 
-    for (int i = 0; i < N; i++)
-    {
-        auto start = high_resolution_clock::now();
+        if (i % 10 == 0){
+            cout << "Batch " << (i / 10) << std::endl;
+        }
+        string name = cabbage_csv_path + std::to_string(i) +".csv";
+        std::ifstream inputFile(name);
+        std::vector<float> values;
+        std::string line, value;
+
+        if (!inputFile.is_open()) {
+            std::cout << "Failed to open the " + name + " file." << std::endl;
+            return -1;
+        }
+
+        while (std::getline(inputFile, line)) {
+            std::istringstream iss(line);
+            while (std::getline(iss, value, ',')) {
+            float floatValue = std::stof(value);
+            values.push_back(floatValue);
+            }
+        }
+        inputFile.close();
+
+        // Convert vector to float array
+        float* input_ff = new float[values.size()];
+        std::copy(values.begin(), values.end(), input_ff);
 
         // Allocate device memory for input image
         float* input_f_ptr = (float*) malloc_device(3 * 224 * 224 * sizeof(float), q);
+        
         auto input_to_device_event = q.memcpy(input_f_ptr, input_ff, 3*224*224 * sizeof(float));
         input_to_device_event.wait();
-        
 
         // Quantise the input.
-        int8_t* input_ptr = quant(q, 3 * 224 * 224, 0.01979798823595047, input_f_ptr);
+        // original scale - 0.01979798823595047
+        int8_t* input_ptr = quant(q, 3 * 224 * 224, 0.0001, input_f_ptr);
+
+        cout << "Input ptr: " << static_cast<int>(input_ptr[0]) 
+    << " " << static_cast<int>(input_ptr[1]) 
+    << " "<< static_cast<int>(input_ptr[2]) 
+    << " " << std::endl;
+
+        // /* Quantisation testing code */
+
+        int len = 3 * 224 * 224;
+
+        // Open the output file
+        std::ofstream outputFile("outputTest.csv");
+        if (!outputFile.is_open())
+        {
+            std::cerr << "Failed to open output file." << std::endl;
+            return 1;
+        }
+        
+
+        // Write the array values to the output file
+        for (int i = 0; i < len; ++i)
+        {
+            if (i != 0)  // Don't add a comma before the first value
+                outputFile << ",";
+            outputFile << static_cast<int>(input_ptr[i]);  // Convert int8_t to int for output
+        }
+
+        // Close the output file
+        outputFile.close();
+
+        std::cout << "Values written to output file successfully." << std::endl;
+
+        /* */
 
         // Convolutional layers (* 2).
         // input 3 * 224 * 224, output 64*224*224
         int8_t* conved1_ptr = conv_pad_q<Conv1ID, 3, 224, 64>(q, input_ptr, weights1, biases1, 0.01979798823595047, 0.013484773226082325, 0.04881289601325989);
-        // input 64*224*224, output 64*112*122
-        int8_t* pooled1_ptr = max_pool_q(q, 64, 224, 224, conved1_ptr);
         
+    //     cout << "Conved ptr: " << static_cast<int>(conved1_ptr[0]) 
+    // << " " << static_cast<int>(conved1_ptr[1]) 
+    // << " "<< static_cast<int>(conved1_ptr[2]) 
+    // << " " << std::endl;
+
+        // input 64*224*224, output 64*112*112
+        int8_t* pooled1_ptr = max_pool_q(q, 64, 224, 224, conved1_ptr);
+
         //  int8_t* conved2_ptr = conv_pad_q<64>(q, 112, pooled1_ptr, weights2, 512, biases2, 0.04881289601325989, 0.0006907337228767574, 0.016132580116391182);
         // input 64*112*112, output  512*112*112
         int8_t* conved2_ptr = conv_pad_q<Conv2ID, 64, 112, 512>(q, pooled1_ptr, weights2, biases2, 0.04881289601325989, 0.0006907337228767574, 0.016132580116391182);
-        
+
+        cout << "Conved2 ptr: " << static_cast<int>(conved2_ptr[0]) 
+    << " " << static_cast<int>(conved2_ptr[10]) 
+    << " "<< static_cast<int>(conved2_ptr[20]) 
+    << " " << std::endl;
+
         // input 512*112*112, output 512*56*56/
         int8_t* pooled2_ptr = max_pool_q(q, 512, 112, 112, conved2_ptr);
         float *pooled2_f_ptr = dequant(q, 512 * 56 * 56, 0.016132580116391182, pooled2_ptr);
 
-        // Prototype layer. // input 512*56*56, output 15*56*56/
+
+        // Prototype layer.
         float *distances_f_ptr = l2_distance(q, 512, 56 * 56, pooled2_f_ptr, 15, prototypes);
+
         float *similarities_f_ptr = distance_2_similarity(q, 15 * 56 * 56, distances_f_ptr);
-        float *avg_f_ptr = top9_average_pooling(q, 15, 56 * 56, similarities_f_ptr);
-        // finally output 15 vector
+
+    //     cout << "Similarites ptr: " << static_cast<float>(similarities_f_ptr[0]) 
+    // << " " << static_cast<float>(similarities_f_ptr[100]) 
+    // << " "<< static_cast<float>(similarities_f_ptr[200]) 
+    // << " " << std::endl;
+
+    // Open the output file
+    // std::ofstream outputFile("similarities.csv");
+    // if (!outputFile.is_open())
+    // {
+    //     std::cerr << "Failed to open output file." << std::endl;
+    //     return 1;
+    // }
+
+    // // Write the array values to the output file
+    // for (int i = 0; i < 15*56*56; ++i)
+    // {
+    //     if (i != 0)  // Don't add a comma before the first value
+    //         outputFile << ",";
+    //     outputFile << static_cast<float>(similarities_f_ptr[i]);  // Convert int8_t to int for output
+    // }
+
+    // // Close the output file
+    // outputFile.close();
+
+    // std::cout << "Values written to output file successfully." << std::endl;
+
+
+    float *avg_f_ptr = top9_average_pooling(q, 15, 56 * 56, similarities_f_ptr);
+
+    //     cout << "Avg ptr: " << static_cast<float>(avg_f_ptr[0]) 
+    // << " " << static_cast<float>(avg_f_ptr[1]) 
+    // << " "<< static_cast<float>(avg_f_ptr[2]) 
+    // << " " << std::endl;
 
         // Compute upsampled activation map (information for interpretation).
         upsample4(q, 15, 56, 56, similarities_f_ptr, upsampled_f);
-        
+
         // Fully-connected layer.
         int8_t *avg_ptr = quant(q, 15, 0.01979798823595047, avg_f_ptr);
         int8_t *logits_ptr = fully_connected(q, 15, 3, avg_ptr, fc_weights);
         float *logits_f_ptr = dequant(q, 3, 0.06617073714733124, logits_ptr);
-
-
-        // Compute min_distance (information for interpretation).
-        // bottom9_average_pooling(q, 15, 56 * 56, distances_f, avg_f);
-
 
         q.wait();
         auto logits_to_host = q.submit([&] (handler &h) {
@@ -834,30 +1099,29 @@ int main()
         });
         logits_to_host.wait();
 
-        auto stop = high_resolution_clock::now();
-        times[i] = duration_cast<microseconds>(stop - start).count();
-    }
-    delete[] input_ff;
+        // index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
+        int logit = 0;
+        int max = -1;
+        cout << "Logit " << i << " are: "
+            << logits_f[0] << " " << logits_f[1] << " "<< logits_f[2] << std::endl;
+        for (int i = 0; i < 3; i++) {
+            if (logits_f_ptr[i] > max) {
+                max = logits_f_ptr[i];
+                logit = i;
+            }
+        }
 
-    // Print out the output.
-    // The index corresponding to the maximum value is the 
-    // index of the chosen classification. 0 For cabbage; 1 for carrot; 2 for tomato.
-    cout << "Peeking... ";
-    peek(1, 3, logits_f, true);
-    // peek(1, 15, avg_f, false);
-    peek(224, 224, upsampled_f, true);
-    peek(224, 224, upsampled_f + 224 * 224, true);
-    peek(224, 224, upsampled_f + 14 * 224 * 224, true);
+        if (logit == 0) {
+            cabbage_acc++;
+        }
 
-    // Output timings.
-    long total = 0;
-    for (int i = 0; i < N; i++)
-    {
-        total += times[i];
-        cout << "Iteration " << (i + 1) << ": " << (float)times[i] / 1e6 << std::endl;
+        delete[] logits_f;
+        delete[] upsampled_f;
+        delete[] input_ff;
     }
 
-    cout << "Total: " << (float)total / 1e6 << std::endl;
+    float acc = cabbage_acc / 420;
+    cout << "Cabbage accuracy was: " << acc << std::endl;
 
     delete[] weights1;
     delete[] biases1;
@@ -866,14 +1130,6 @@ int main()
     delete[] prototypes;
     delete[] fc_weights;
 
-    delete[] logits_f;
-    delete[] upsampled_f;
-    // delete[] input_ff;
 
-    return 0;
-    }
-    else {
-   std::cout << "Failed to open the input file." << std::endl;
-   return 1;
-  }
+    return (int) acc;
 }

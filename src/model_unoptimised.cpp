@@ -436,6 +436,7 @@ float *read_param(ifstream &rf) {
   rf.read((char *)(&len), 4);
   float *result = new float[len];
   rf.read((char *)result, len * 4);
+  cout << "Read " << len << " params" << std::endl;
   return result;
 }
 
