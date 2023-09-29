@@ -6,7 +6,7 @@ kernels on intel devcloud FPGA nodes. Results have been obtained via emulation d
 ## Understanding the Codebase
 
 The *scripts* directory shows examples of how the code can be compiled, emulated etc. The main source code can be found
-under the *src* directory. The file to look at should be src/model_unoptimised.cpp to understand hpw the kernels implement
+under the *src* directory. The file to look at should be src/model_unoptimised.cpp to understand how the kernels implement
 the different layers. 
 
 The test directory contains numpy arrays under 3 classes used for testing the data.
